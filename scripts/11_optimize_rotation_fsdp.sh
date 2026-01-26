@@ -7,11 +7,39 @@
 
 # nnodes determines the number of GPU nodes to utilize (usually 1 for an 8 GPU node)
 # nproc_per_node indicates the number of GPUs per node to employ.
+
+# Parse model name from input path (e.g., meta-llama/Llama-2-70b-hf -> Llama_2_70b_hf)
+MODEL_NAME=$(echo $1 | sed 's/.*\///' | sed 's/-/_/g')
+BUILD_DIR="${MODEL_NAME}_w${2}a${3}kv${4}"
+
+# Remove existing directory if it exists
+if [ -d "$BUILD_DIR" ]; then
+    echo "=================================================="
+    echo "Removing existing directory: $BUILD_DIR"
+    echo "=================================================="
+    rm -rf "$BUILD_DIR"
+fi
+
+# Create directory structure
+echo "=================================================="
+echo "Creating build directory: $BUILD_DIR"
+echo "=================================================="
+mkdir -p "$BUILD_DIR/your_path"
+mkdir -p "$BUILD_DIR/your_output_path"
+mkdir -p "$BUILD_DIR/your_log_path"
+
+echo "Directory structure created:"
+echo "  - $BUILD_DIR/your_path        (for rotation matrices)"
+echo "  - $BUILD_DIR/your_output_path (for checkpoints)"
+echo "  - $BUILD_DIR/your_log_path    (for training logs)"
+echo "=================================================="
+echo ""
+
 torchrun --nnodes=1 --nproc_per_node=8 optimize_rotation.py \
 --input_model $1  \
---output_rotation_path "your_path" \
---output_dir "your_output_path/" \
---logging_dir "your_log_path/" \
+--output_rotation_path "${BUILD_DIR}/your_path" \
+--output_dir "${BUILD_DIR}/your_output_path/" \
+--logging_dir "${BUILD_DIR}/your_log_path/" \
 --model_max_length 2048 \
 --fp16 False \
 --bf16 True \

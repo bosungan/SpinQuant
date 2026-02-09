@@ -139,17 +139,17 @@ class ActQuantizer(torch.nn.Module):
         if self.sym:
             xmax = torch.maximum(torch.abs(xmin), xmax)
             tmp = xmax == 0
-            self.scale = xmax / self.maxq
+            self.scale = (xmax / self.maxq).half()
             self.scale[tmp] = 1
             self.zero = torch.zeros_like(self.scale)
         else:
             tmp = (xmin == 0) & (xmax == 0)
             xmin[tmp] = -1
             xmax[tmp] = +1
-            self.scale = (xmax - xmin) / (2 * self.maxq + 1)
+            self.scale = ((xmax - xmin) / (2 * self.maxq + 1)).half()
             self.zero = -(self.maxq + 1) - torch.round(xmin / self.scale)
 
-        self.scale = self.scale.repeat(1, 1, 1, self.groupsize).reshape(init_shape)
+        self.scale = self.scale.repeat(1, 1, 1, self.groupsize).reshape(init_shape).half()
         self.zero = self.zero.repeat(1, 1, 1, self.groupsize).reshape(init_shape)
 
     def find_params(self, x) -> None:
@@ -177,7 +177,7 @@ class ActQuantizer(torch.nn.Module):
             tmp = xmax == 0
             self.scale = (xmax / self.maxq).unsqueeze(1).repeat(1, reshaped_x.shape[-1])
             self.scale[tmp] = 1
-            self.scale = self.scale.reshape(init_shape)
+            self.scale = self.scale.reshape(init_shape).half()
             self.zero = torch.zeros_like(self.scale)
         else:
             tmp = (xmin == 0) & (xmax == 0)
@@ -189,7 +189,7 @@ class ActQuantizer(torch.nn.Module):
             self.scale = (
                 self.scale.unsqueeze(1)
                 .repeat(1, reshaped_x.shape[-1])
-                .reshape(init_shape)
+                .reshape(init_shape).half()
             )
             self.zero = (
                 self.zero.unsqueeze(1)
@@ -341,13 +341,13 @@ class WeightQuantizer(torch.nn.Module):
 
         if self.sym:
             xmax = torch.maximum(torch.abs(xmin), xmax).clamp(min=1e-5)
-            self.scale = xmax / self.maxq
+            self.scale = (xmax / self.maxq).half()
             self.zero = torch.zeros_like(self.scale)
         else:
             tmp = (xmin == 0) & (xmax == 0)
             xmin[tmp] = -1
             xmax[tmp] = +1
-            self.scale = (xmax - xmin).clamp(min=1e-5) / (2 * self.maxq + 1)
+            self.scale = ((xmax - xmin).clamp(min=1e-5) / (2 * self.maxq + 1)).half()
             self.zero = -(self.maxq + 1) - torch.round(xmin / self.scale)
 
         self.scale = self.scale.repeat(1, 1, self.weight_groupsize)
@@ -363,13 +363,13 @@ class WeightQuantizer(torch.nn.Module):
                 xmax1 = p * xmax
 
                 if self.sym:
-                    scale1 = xmax1 / self.maxq
+                    scale1 = (xmax1 / self.maxq).half()
                     zero1 = torch.zeros_like(scale1)
                     scale1 = scale1.repeat(1, 1, self.weight_groupsize)
                     zero1 = zero1.repeat(1, 1, self.weight_groupsize)
                     q = sym_quant_dequant(x, scale1, self.maxq)
                 else:
-                    scale1 = (xmax1 - xmin1) / (2 * self.maxq + 1)
+                    scale1 = ((xmax1 - xmin1) / (2 * self.maxq + 1)).half()
                     zero1 = -(self.maxq + 1) - torch.round(xmin1 / scale1)
                     scale1 = scale1.repeat(1, 1, self.weight_groupsize)
                     zero1 = zero1.repeat(1, 1, self.weight_groupsize)
@@ -385,7 +385,7 @@ class WeightQuantizer(torch.nn.Module):
                     self.scale[tmp] = scale1[tmp]
                     self.zero[tmp] = zero1[tmp]
 
-        self.scale = self.scale.reshape(init_shape)
+        self.scale = self.scale.reshape(init_shape).half()
         self.zero = self.zero.reshape(init_shape)
 
     def find_params(self, x) -> None:
@@ -412,13 +412,13 @@ class WeightQuantizer(torch.nn.Module):
 
         if self.sym:
             xmax = torch.maximum(torch.abs(xmin), xmax).clamp(min=1e-5)
-            self.scale = xmax / self.maxq
+            self.scale = (xmax / self.maxq).half()
             self.zero = torch.zeros_like(self.scale)
         else:
             tmp = (xmin == 0) & (xmax == 0)
             xmin[tmp] = -1
             xmax[tmp] = +1
-            self.scale = (xmax - xmin).clamp(min=1e-5) / (2 * self.maxq + 1)
+            self.scale = ((xmax - xmin).clamp(min=1e-5) / (2 * self.maxq + 1)).half()
             self.zero = -(self.maxq + 1) - torch.round(xmin / self.scale)
 
         if self.mse:
@@ -429,11 +429,11 @@ class WeightQuantizer(torch.nn.Module):
                 xmax1 = p * xmax
 
                 if self.sym:
-                    scale1 = xmax1 / self.maxq
+                    scale1 = (xmax1 / self.maxq).half()
                     zero1 = torch.zeros_like(scale1)
                     q = sym_quant_dequant(x, scale1.unsqueeze(1), self.maxq)
                 else:
-                    scale1 = (xmax1 - xmin1) / (2 * self.maxq + 1)
+                    scale1 = ((xmax1 - xmin1) / (2 * self.maxq + 1)).half()
                     zero1 = -(self.maxq + 1) - torch.round(xmin1 / scale1)
                     q = asym_quant_dequant(
                         x, scale1.unsqueeze(1), zero1.unsqueeze(1), self.maxq
@@ -454,7 +454,7 @@ class WeightQuantizer(torch.nn.Module):
             self.zero = self.zero.repeat(tmp)
 
         shape = [-1] + [1] * (len(shape) - 1)
-        self.scale = self.scale.reshape(shape)
+        self.scale = self.scale.reshape(shape).half()
         self.zero = self.zero.reshape(shape)
         return
 

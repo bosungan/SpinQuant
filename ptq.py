@@ -46,7 +46,7 @@ def train() -> None:
     if process_word_embeddings:
         model.lm_head.weight.data = model.model.embed_tokens.weight.data.clone()
     model.cuda()
-
+    
     model = ptq_model(ptq_args, model, model_args)
     model.seqlen = training_args.model_max_length
     if local_rank == 0:

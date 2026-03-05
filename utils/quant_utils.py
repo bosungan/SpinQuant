@@ -16,6 +16,7 @@ import transformers
 from train_utils.quant_linear import QuantizeLinear
 from utils import hadamard_utils
 from utils.utils import HadamardTransform
+from utils.figna_utils import custom_fp16_int4_gemm
 
 
 def get_minq_maxq(bits, sym):
@@ -222,6 +223,8 @@ class ActQuantWrapper(torch.nn.Module):
         self.online_partial_had = False
         self.had_dim = 0
         self.fp32_had = False
+        self.use_custom_kernel = False
+        self.printed_once = False
 
     def extra_repr(self) -> str:
         str_ = f"Input Quantizer Bits: {self.quantizer.bits}"
@@ -244,7 +247,7 @@ class ActQuantWrapper(torch.nn.Module):
 
     def forward(self, x, R1=None, R2=None, transpose=False):
         x_dtype = x.dtype
-
+        
         # Rotate, if needed
         if self.online_full_had:
             if self.fp32_had:  # Full Hadamard in FP32
@@ -284,10 +287,47 @@ class ActQuantWrapper(torch.nn.Module):
             self.quantizer.find_params(x)
             x = self.quantizer(x).to(x_dtype)
             self.quantizer.free()
+            
+        # Using custom kernel 
+        # Debug: Check custom kernel usage
+        # if not self.printed_once:
+        #     self.printed_once = True
+        #     w = self.module.weight
+        #     inner_t = type(self.module)
+        #     has_int_weight = hasattr(self.module, "int_weight")
+        #     has_scale = hasattr(self.module, "scale")
+        #     has_zero = hasattr(self.module, "zero")
+
+        #     print(
+        #         f"[ActQuantWrapper] W={tuple(w.shape)} inner={inner_t} | "
+        #         f"int_weight={has_int_weight} scale={has_scale} zero={has_zero} | "
+        #         f"use_custom_kernel={self.use_custom_kernel}"
+        #     )
+        
+        # if self.use_custom_kernel and hasattr(self.module, 'int_weight'):
+        #     x = custom_fp16_int4_gemm(
+        #         x,                           # FP16 activation
+        #         self.module.int_weight,      # INT4 weight
+        #         self.module.scale,           # scale
+        #         self.module.zero,            # zero point (asymmetric)
+        #         self.bias
+        #     ).to(x_dtype)
+        # else:
+        
+        
         if R1 is not None:
+            print("Using rotation in ActQuantWrapper forward pass.")
             x = self.module(x, R1, R2, transpose).to(x_dtype)
         else:
-            x = self.module(x).to(x_dtype)
+            if self.use_custom_kernel and hasattr(self.module, 'int_weight'):
+                x = custom_fp16_int4_gemm(
+                    x,                           # FP16 activation
+                    self.module.int_weight,      # INT4 weight
+                    self.module.scale,           # scale
+                    self.bias
+                ).to(x_dtype)
+            else:
+                x = self.module(x).to(x_dtype)
 
         if self.out_quantizer.bits < 16:  # Quantize the output, if needed
             self.out_quantizer.find_params(x)
@@ -474,8 +514,13 @@ class WeightQuantizer(torch.nn.Module):
         x_dtype = x.dtype
         if self.ready() and self.bits < 16:
             scale = self.scale.to(x.device)
-            q = torch.clamp(torch.round(x / scale), -(self.maxq + 1), self.maxq)
-            return (scale * q).to(x_dtype), q, scale
+            zero = self.zero.to(x.device)
+            if self.sym:
+                q = torch.clamp(torch.round(x / scale), -(self.maxq + 1), self.maxq)
+                return (scale * q).to(x_dtype), q, scale, zero
+            else:
+                q = torch.clamp(torch.round(x / scale) + zero, -(self.maxq + 1), self.maxq)
+                return (scale * (q - zero)).to(x_dtype), q, scale, zero
         else:
             return None, None, None
 

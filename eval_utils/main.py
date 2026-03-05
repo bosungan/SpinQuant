@@ -18,6 +18,8 @@ from utils.convert_to_executorch import (
     write_model_llama,
 )
 
+from logging import Logger
+log: Logger = utils.get_logger("spinquant")
 
 def ptq_model(args, model, model_args=None):
     transformers.set_seed(args.seed)
@@ -43,6 +45,7 @@ def ptq_model(args, model, model_args=None):
             model
         )  # Add Activation Wrapper to the model as the rest of the code assumes it is present
 
+    
     if args.w_bits < 16:
         save_dict = {}
         if args.load_qmodel_path:  # Load Quantized Rotated Model
@@ -76,7 +79,6 @@ def ptq_model(args, model, model_args=None):
         else:  # RTN Weight Quantization
             quantizers = gptq_utils.rtn_fwrd(model, "cuda", args)
             save_dict["w_quantizers"] = quantizers
-
         if args.save_qmodel_path:
             save_dict["model"] = model.state_dict()
             if args.export_to_et:
@@ -153,5 +155,18 @@ def ptq_model(args, model, model_args=None):
                     config=model.config,
                     **k_quant_config,
                 )
-
+                
+    # FIGNA PoC
+    if args.use_custom_kernel:
+        print("[FIGNA POC] Enable custom kernels for quantized layers")
+        qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        for name in qlayers:
+            print(f"Checking {name} for custom kernel support...")
+            if hasattr(qlayers[name].module, 'int_weight'):
+                print(f"Enabling custom kernel for {name} with int_weight shape {qlayers[name].module.int_weight.shape}")
+                qlayers[name].use_custom_kernel = True
+                print(f"Enable custom kernel for {name}")
+            if hasattr(qlayers[name], "printed_once"):
+                qlayers[name].printed_once = False
+                
     return model

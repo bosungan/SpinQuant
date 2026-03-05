@@ -230,6 +230,12 @@ def parser_gen():
         default=False,
         help="Export the quantized model to executorch and save in save_qmodel_path",
     )
+    parser.add_argument(
+        "--use_custom_kernel",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use custom FP16-INT4 GEMM kernel instead of fake quantization",
+    )
 
     # Experiments Arguments
     parser.add_argument(

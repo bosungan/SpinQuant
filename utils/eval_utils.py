@@ -79,8 +79,12 @@ def evaluator(model, testenc, dev, args):
     torch.cuda.empty_cache()
     outs = [0] * nbatches
     attention_mask = cache["attention_mask"]
+    
+    print("Evaluating the model layer by layer...")
 
-    for i in tqdm(range(len(layers)), desc="(Eval) Layers"):
+    # for i in tqdm(range(len(layers)), desc="(Eval) Layers"):
+    for i in range(len(layers)):
+        print(f"Processing layer {i+1}/{len(layers)}")
         layer = layers[i].to(dev)
 
         # Dump the layer input and output

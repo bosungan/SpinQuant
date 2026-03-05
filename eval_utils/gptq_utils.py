@@ -20,7 +20,6 @@ import tqdm
 
 from utils import quant_utils, utils
 
-
 class GPTQ:
     def __init__(self, layer):
         self.layer = layer
@@ -122,7 +121,7 @@ class GPTQ:
                             idx = perm[idx]
                         self.quantizer = groups[idx // groupsize]
 
-                q, int_weight, scale = self.quantizer.fake_quantize(w.unsqueeze(1))
+                q, int_weight, scale, zero = self.quantizer.fake_quantize(w.unsqueeze(1))
                 Q1[:, i] = q.flatten()
                 q = q.flatten()
                 W_int1[:, i] = int_weight.flatten()
@@ -146,11 +145,20 @@ class GPTQ:
         if actorder:
             Q = Q[:, invperm]
 
-        if export_to_et:
-            self.layer.register_buffer(
-                "int_weight", W_int.reshape(self.layer.weight.shape)
-            )
-            self.layer.register_buffer("scale", Scale)
+        # if export_to_et:
+        #     self.layer.register_buffer(
+        #         "int_weight", W_int.reshape(self.layer.weight.shape)
+        #     )
+        #     self.layer.register_buffer("scale", Scale)
+        
+        # always register int_weight and scale
+        W_int = W_int.to(torch.int8)
+        self.layer.register_buffer(
+            "int_weight", W_int.reshape(self.layer.weight.shape)
+        )
+        self.layer.register_buffer("scale", Scale)
+        self.layer.register_buffer("groupsize", torch.tensor(groupsize))
+        
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(
             self.layer.weight.data.dtype
         )
@@ -321,7 +329,7 @@ def rtn_fwrd(model, dev, args, custom_layers=None):
 
     quantizers = {}
 
-    for i in tqdm.tqdm(range(len(layers)), desc="(RtN Quant.) Layers"):
+    for i in tqdm (range(len(layers)), desc="(RtN Quant.) Layers"):
         layer = layers[i].to(dev)
 
         subset = quant_utils.find_qlayers(
@@ -349,11 +357,11 @@ def rtn_fwrd(model, dev, args, custom_layers=None):
             )
             W = subset[name].weight.data
             quantizer.find_params(W)
-            q, int_weight, scale = quantizer.fake_quantize(W)
+            q, int_weight, scale, zero = quantizer.fake_quantize(W)
             subset[name].weight.data = q.to(next(iter(layer.parameters())).dtype)
             if args.export_to_et:
                 subset[name].register_buffer("int_weight", int_weight)
-                subset[name].register_buffer("scale", scale)
+                subset[name].register_buffer("scale", scale)        
             quantizers["model.layers.%d.%s" % (i, name)] = quantizer.cpu()
         layers[i] = layer.cpu()
         torch.cuda.empty_cache()

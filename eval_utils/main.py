@@ -24,7 +24,7 @@ log: Logger = utils.get_logger("spinquant")
 def ptq_model(args, model, model_args=None):
     transformers.set_seed(args.seed)
     model.eval()
-
+    
     # Rotate the weights
     if args.rotate:
         fuse_norm_utils.fuse_layer_norms(model)
@@ -168,5 +168,23 @@ def ptq_model(args, model, model_args=None):
                 print(f"Enable custom kernel for {name}")
             if hasattr(qlayers[name], "printed_once"):
                 qlayers[name].printed_once = False
+    
+    # Custom Attention - Set flag on model config and wrappers
+    if args.custom_attention:
+        print("[FIGNA POC] Enable custom attention for K/V quantization")
+        model.config.custom_attention = True
+        
+        # Set custom_attention flag on ActQuantWrappers (for V caching)
+        qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        for name in qlayers:
+            qlayers[name].custom_attention = True
+            if 'v_proj' in name:
+                print(f"  Enabled V caching for {name}")
+        
+        # Set custom_attention flag on QKRotationWrappers (for K caching)
+        for layer in model.model.layers:
+            if hasattr(layer.self_attn, 'apply_rotary_pos_emb_qk_rotation_wrapper'):
+                layer.self_attn.apply_rotary_pos_emb_qk_rotation_wrapper.custom_attention = True
+                print(f"  Enabled K caching for layer")
                 
     return model

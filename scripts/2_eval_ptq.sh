@@ -23,7 +23,7 @@ V_QUANT="sym"
 # Build directory name: {model}_W{w}A{a}KV{kv}_{dtype}_K{k_quant}_V{v_quant}
 BUILD_DIR="${MODEL_NAME}_w${2}a${3}kv${4}_${DTYPE}_K_${K_QUANT}_V_${V_QUANT}"
 
-CUDA_VISIBLE_DEVICES=3 torchrun --master_port=29502 --nnodes=1 --nproc_per_node=1 ptq.py \
+CUDA_VISIBLE_DEVICES=2 torchrun --master_port=29502 --nnodes=1 --nproc_per_node=1 ptq.py \
 --input_model $1 \
 --do_train False \
 --do_eval True \
@@ -44,4 +44,4 @@ CUDA_VISIBLE_DEVICES=3 torchrun --master_port=29502 --nnodes=1 --nproc_per_node=
 --w_groupsize 32 \
 --rotate \
 --optimized_rotation_path "${BUILD_DIR}/your_path/R.bin" \
---use_custom_kernel \
+--custom_attention \

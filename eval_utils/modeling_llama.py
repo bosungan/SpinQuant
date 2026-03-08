@@ -53,6 +53,8 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 
 logger = logging.get_logger(__name__)
 
+from utils import figna_utils
+
 _CONFIG_FOR_DOC = "LlamaConfig"
 
 
@@ -700,6 +702,7 @@ class LlamaSdpaAttention(LlamaAttention):
         ] = None,  # will become mandatory in v4.46
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # print("[LlamaSdpaAttention] Using torch.nn.functional.scaled_dot_product_attention")
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
             logger.warning_once(
@@ -772,14 +775,100 @@ class LlamaSdpaAttention(LlamaAttention):
         # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
         is_causal = True if causal_mask is None and q_len > 1 else False
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=causal_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            is_causal=is_causal,
-        )
+
+        # === Custom FP-INT Attention ===
+        # Check if we should use custom attention
+        use_custom_attn = hasattr(self.config, 'custom_attention') and self.config.custom_attention
+                
+        if use_custom_attn:
+            print("[LlamaSdpaAttention] Using custom FP-INT attention")
+            
+            # Get cached quantized K from QKRotationWrapper
+            if hasattr(self, 'apply_rotary_pos_emb_qk_rotation_wrapper'):
+                qk_wrapper = self.apply_rotary_pos_emb_qk_rotation_wrapper
+                if hasattr(qk_wrapper, 'last_k_int') and qk_wrapper.last_k_int is not None:
+                    # Reshape cached K to (bsz, num_heads, seq_len, head_dim)
+                    bsz_k, num_heads_k, seq_len_k, head_dim_k = qk_wrapper.last_k_shape
+                    if qk_wrapper.last_k_groupsize == -1:  # token-wise
+                        k_int = qk_wrapper.last_k_int.reshape(bsz_k, seq_len_k, num_heads_k, head_dim_k).transpose(1, 2)
+                        k_scale = qk_wrapper.last_k_scale.reshape(bsz_k, seq_len_k, num_heads_k, head_dim_k).transpose(1, 2)
+                        if qk_wrapper.last_k_zero is not None:
+                            k_zero = qk_wrapper.last_k_zero.reshape(bsz_k, seq_len_k, num_heads_k, head_dim_k).transpose(1, 2)
+                        else:
+                            k_zero = torch.zeros_like(k_scale)
+                    else:  # head-wise
+                        k_int = qk_wrapper.last_k_int.reshape(bsz_k, num_heads_k, seq_len_k, head_dim_k)
+                        k_scale = qk_wrapper.last_k_scale.reshape(bsz_k, num_heads_k, seq_len_k, head_dim_k)
+                        if qk_wrapper.last_k_zero is not None:
+                            k_zero = qk_wrapper.last_k_zero.reshape(bsz_k, num_heads_k, seq_len_k, head_dim_k)
+                        else:
+                            k_zero = torch.zeros_like(k_scale)
+                    print(f"  K from cache: k_int.shape={k_int.shape}, dtype={k_int.dtype}")
+                else:
+                    # No quantization, use FP16 directly
+                    k_int = key_states
+                    k_scale = torch.ones_like(key_states)
+                    k_zero = torch.zeros_like(key_states)
+                    print(f"  K not quantized, using FP16")
+            else:
+                k_int = key_states
+                k_scale = torch.ones_like(key_states)
+                k_zero = torch.zeros_like(key_states)
+            
+            # Get cached quantized V from v_proj's ActQuantWrapper
+            if hasattr(self.v_proj, 'last_output_int') and self.v_proj.last_output_int is not None:
+                # v_proj output is (bsz * seq_len, hidden_size)
+                # Need to reshape to (bsz, num_heads, seq_len, head_dim)
+                v_int = self.v_proj.last_output_int.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                v_scale = self.v_proj.last_output_scale.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                if self.v_proj.last_output_zero is not None:
+                    v_zero = self.v_proj.last_output_zero.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+                else:
+                    v_zero = torch.zeros_like(v_scale)
+                print(f"  V from cache: v_int.shape={v_int.shape}, dtype={v_int.dtype}")
+            else:
+                # No quantization, use FP16 directly
+                v_int = value_states
+                v_scale = torch.ones_like(value_states)
+                v_zero = torch.zeros_like(value_states)
+                print(f"  V not quantized, using FP16")
+                
+            # print part of the quantized K and V for debugging
+            print(f"  Sample k_int[0, 0, :5, :5]:\n{k_int[0, 0, :5, :5]}")
+            print(f"  Sample v_int[0, 0, :5, :5]:\n{v_int[0, 0, :5, :5]}")
+            
+            # Call custom attention
+            query_states = query_states.half()
+            k_int = k_int.clamp(-8, 7).to(torch.int8)
+            v_int = v_int.clamp(-8, 7).to(torch.int8)
+            k_scale = k_scale.to(torch.float16)
+            v_scale = v_scale.to(torch.float16)
+            k_zero = k_zero.to(torch.int32)
+            v_zero = v_zero.to(torch.int32)
+            
+            attn_output = figna_utils.custom_fp_int_attention(
+                query=query_states,
+                key_int=k_int,
+                value_int=v_int,
+                scale_k=k_scale,
+                zero_k=k_zero,
+                scale_v=v_scale,
+                zero_v=v_zero,
+                attn_mask=causal_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=is_causal,
+            )
+        else:
+            # Use standard SDPA
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=causal_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=is_causal,
+            )
+
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, -1)

@@ -225,6 +225,7 @@ class ActQuantWrapper(torch.nn.Module):
         self.fp32_had = False
         self.use_custom_kernel = False
         self.printed_once = False
+        self.custom_attention = False  # Flag for custom attention caching
 
     def extra_repr(self) -> str:
         str_ = f"Input Quantizer Bits: {self.quantizer.bits}"
@@ -331,6 +332,14 @@ class ActQuantWrapper(torch.nn.Module):
 
         if self.out_quantizer.bits < 16:  # Quantize the output, if needed
             self.out_quantizer.find_params(x)
+            # Cache quantized values for custom attention
+            if hasattr(self, 'custom_attention') and self.custom_attention:
+                print("Caching quantized output for custom attention.")
+                if self.out_quantizer.sym:
+                    self.last_output_int, self.last_output_scale = self.out_quantizer.quantize(x)
+                    self.last_output_zero = None
+                else:
+                    self.last_output_int, self.last_output_scale, self.last_output_zero = self.out_quantizer.quantize(x)
             x = self.out_quantizer(x).to(x_dtype)
             self.out_quantizer.free()
 

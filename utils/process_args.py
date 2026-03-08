@@ -237,6 +237,13 @@ def parser_gen():
         help="Use custom FP16-INT4 GEMM kernel instead of fake quantization",
     )
 
+    parser.add_argument(
+        "--custom_attention",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use custom FP-INT attention kernel for QK^T and PV operations",
+    )
+
     # Experiments Arguments
     parser.add_argument(
         "--capture_layer_io",

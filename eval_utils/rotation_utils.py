@@ -160,6 +160,7 @@ class QKRotationWrapper(torch.nn.Module):
         self.func = func
         self.k_quantizer = quant_utils.ActQuantizer()
         self.k_bits = 16
+        self.custom_attention = False  # Flag for custom attention caching
         if kwargs is not None:
             assert kwargs["k_groupsize"] in [
                 -1,
@@ -186,6 +187,13 @@ class QKRotationWrapper(torch.nn.Module):
         if self.k_groupsize == -1:  # token-wise quantization
             token_wise_k = k.transpose(1, 2).reshape(-1, num_heads * head_dim)
             self.k_quantizer.find_params(token_wise_k)
+            # Cache quantized K for custom attention
+            if hasattr(self, 'custom_attention') and self.custom_attention:
+                if self.k_quantiezr.sym:
+                    self.last_k_int, self.last_k_scale = self.k_quantizer.quantize(token_wise_k)
+                    self.last_k_zero = None
+                else:
+                    self.last_k_int, self.last_k_scale, self.last_k_zero = self.k_quantizer.quantize(token_wise_k)
             k = (
                 self.k_quantizer(token_wise_k)
                 .reshape((bsz, seq_len, num_heads, head_dim))
@@ -195,6 +203,13 @@ class QKRotationWrapper(torch.nn.Module):
         else:  # head-wise quantization
             per_head_k = k.view(-1, head_dim)
             self.k_quantizer.find_params(per_head_k)
+            # Cache quantized K for custom attention
+            if hasattr(self, 'custom_attention') and self.custom_attention:
+                if self.k_quantizer.sym:
+                    self.last_k_int, self.last_k_scale = self.k_quantizer.quantize(per_head_k)
+                    self.last_k_zero = None
+                else:
+                    self.last_k_int, self.last_k_scale, self.last_k_zero = self.k_quantizer.quantize(per_head_k)
             k = (
                 self.k_quantizer(per_head_k)
                 .reshape((bsz, num_heads, seq_len, head_dim))
@@ -202,6 +217,11 @@ class QKRotationWrapper(torch.nn.Module):
             )
 
         self.k_quantizer.free()
+        
+        # Store shape info for later reshaping in attention
+        if hasattr(self, 'custom_attention') and self.custom_attention:
+            self.last_k_shape = (bsz, num_heads, seq_len, head_dim)
+            self.last_k_groupsize = self.k_groupsize
 
         return q, k
 

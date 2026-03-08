@@ -164,7 +164,6 @@ def custom_fp_int_attention(
     return attn_output.to(query.dtype)
 
 
-
 def _prealign_torch_fp16bits(
     input_fp16: torch.Tensor,  # (M,K) float16
     extra_bitwidth: int,
@@ -211,172 +210,125 @@ def _prealign_torch_fp16bits(
 
 @torch.no_grad()
 def fpint_gemm_qcol_real_2scomp_torch(
-    input_data: torch.Tensor,   # Shape: (M, K), dtype: float16
-    weight_data: torch.Tensor,  # Shape: (K, N), dtype: int8
-    scale_data: torch.Tensor,   # Shape: (KG, N), dtype: float16
-    zero_data: torch.Tensor,    # Shape: (KG, N), dtype: int16 or float16
-    groupsize: int,             # Quantization block size in K direction
-    debug: bool = False
+    input_data: torch.Tensor,   # (M,K) float16
+    weight_data: torch.Tensor,  # (K,N) int8 (signed)
+    scale_data: torch.Tensor,   # (K,N) float16/float32 (duplicated per groupsize on K)
+    zero_data: torch.Tensor,    # (K,N) int16/int32 (duplicated per groupsize on K)
+    groupsize: int,
+    out_dtype: torch.dtype = torch.float16,
+    debug: bool = False,
 ) -> torch.Tensor:
     """
-    FPINT GEMM with column-wise quantization (qcol) using 2's complement encoding - PyTorch version
-    
-    Args:
-        input_data: FP16 input activations, shape (M, K)
-        weight_data: Quantized weights (int8), shape (K, N)
-        scale_data: FP16 scale factors, shape (K//groupsize, N)
-        zero_data: Zero points (int16 or fp16), shape (K//groupsize, N)
-        groupsize: Quantization block size in K direction
-        debug: Enable debug printing
-        
-    Returns:
-        output_data: FP16 output, shape (M, N)
+    MAC-loop emulation (closest to 16x16 HW behavior):
     """
+    assert input_data.is_cuda and weight_data.is_cuda and scale_data.is_cuda and zero_data.is_cuda
+    assert input_data.dtype == torch.float16
+    assert weight_data.dtype in (torch.int8, torch.int16, torch.int32)
+    assert zero_data.dtype in (torch.int16, torch.int32)
+    assert scale_data.dtype in (torch.float16, torch.float32)
+
     M, K = input_data.shape
     K_w, N = weight_data.shape
-    assert K == K_w, f"K mismatch: input {K} vs weight {K_w}"
-    
-    device = input_data.device
-    dtype = input_data.dtype
-    
-    # KG = number of quantization blocks in K direction
-    KG = scale_data.shape[0]
-    
-    if debug:
-        print(f"[FPINT_EMUL.QCOL_REAL_2SCOMP_TORCH] M={M}, N={N}, K={K}, KG={KG}, groupsize={groupsize}")
-        print(f"  input: {input_data.shape} {input_data.dtype}")
-        print(f"  weight: {weight_data.shape} {weight_data.dtype}")
-        print(f"  scale: {scale_data.shape} {scale_data.dtype}")
-        print(f"  zero: {zero_data.shape} {zero_data.dtype}")
-    
-    # Ensure weight_data is int8
-    if weight_data.dtype != torch.int8:
-        weight_data = weight_data.to(torch.int8)
-    
-    # Ensure zero_data is int16 for proper handling
-    if zero_data.dtype == torch.float16:
-        zero_data = zero_data.to(torch.int16)
-    
-    # Convert to float for computation
-    weight_fp = weight_data.float()
-    scale_fp = scale_data.float()
-    zero_fp = zero_data.float()
-    
-    # Expand scale and zero to match K dimension
-    # scale: (KG, N) -> (K, N) by repeating each block groupsize times
-    scale_expanded = scale_fp.repeat_interleave(groupsize, dim=0)[:K, :]  # (K, N)
-    zero_expanded = zero_fp.repeat_interleave(groupsize, dim=0)[:K, :]    # (K, N)
-    
-    if debug:
-        print(f"  scale_expanded: {scale_expanded.shape}")
-        print(f"  zero_expanded: {zero_expanded.shape}")
-    
-    # Dequantize weights: W_fp = scale * (W_int - zero)
-    weight_dequant = scale_expanded * (weight_fp - zero_expanded)  # (K, N)
-    
-    # Matrix multiplication: output = input @ weight_dequant
-    output_data = torch.matmul(input_data, weight_dequant)  # (M, K) @ (K, N) = (M, N)
-    
-    if debug:
-        print(f"[FPINT_EMUL.QCOL_REAL_2SCOMP_TORCH] Output computed, shape: {output_data.shape}")
-        if M <= 2 and N <= 4:
-            print(f"  Output values:\n{output_data}")
-    
-    return output_data.to(dtype)
+    assert K_w == K
+    assert scale_data.shape == (K, N)
+    assert zero_data.shape == (K, N)
+    assert K % MXU_K == 0
+    assert groupsize > 0 and (K % groupsize == 0)
+
+    # prealign
+    aligned_fx_main, aligned_exp = _prealign_torch_fp16bits(input_data, EXTRA_BIT)
+    aligned_fx_red, _ = _prealign_torch_fp16bits(input_data, EXTRA_BIT_FOR_REDUCE)
+
+    KG = K // MXU_K
+    shift_back = EXTRA_BIT - EXTRA_BIT_FOR_REDUCE
+    mant_scale = 2.0 ** (-(IN_MAN_WIDTH + EXTRA_BIT))
+
+    # float accumulator (matches your python model style)
+    acc = torch.zeros((M, N), device=input_data.device, dtype=torch.float32)
+    two = torch.tensor(2.0, device=input_data.device, dtype=torch.float32)
+
+    for g in range(KG):
+        k0 = g * MXU_K
+        k1 = k0 + MXU_K
+
+        inner = torch.zeros((M, N), device=input_data.device, dtype=torch.int64)
+
+        # 16-lane MAC: inner += a[:,lane] * w[lane,:]
+        for lane in range(MXU_K):
+            a = aligned_fx_main[:, k0 + lane].view(M, 1)                 # (M,1) int64
+            w = weight_data[k0 + lane, :].to(torch.int64).view(1, N)     # (1,N) int64
+            inner += a * w                                               # broadcast → (M,N)
+
+        # === act_sum_for_reduce: int64 sum of 16 lanes (reduce precision path) ===
+        act_sum_red = torch.zeros((M, 1), device=input_data.device, dtype=torch.int64)
+        for lane in range(MXU_K):
+            act_sum_red += aligned_fx_red[:, k0 + lane].view(M, 1)
+
+        # qcol constants (duplicated per groupsize, but we just sample k0)
+        z  = zero_data[k0, :].to(torch.int64).view(1, N)                 # (1,N)
+        sc = scale_data[k0, :].to(torch.float32).view(1, N)              # (1,N)
+
+        # post_inner_product (int64 domain)
+        post = inner - ((z * act_sum_red) << shift_back)                 # (M,N) int64
+
+        # exponent restore (per m, per block g)
+        e = aligned_exp[:, g].to(torch.int32)                            # (M,)
+        exp_scale = torch.pow(two, (e - IN_EXP_BIAS).to(torch.float32)).view(M, 1)
+        post_fp = post.to(torch.float32) * exp_scale * mant_scale        # (M,N) float32
+        acc += post_fp * sc                                              # (M,N) float32
+
+        if debug and g == 0:
+            print("[DEBUG block0]")
+            print(" inner[0,0] =", int(inner[0,0].item()))
+            print(" act_sum_red[0] =", int(act_sum_red[0,0].item()))
+            print(" z[0] =", int(z[0,0].item()))
+            print(" exp(m=0) =", int(e[0].item()))
+            print(" sc[0] =", float(sc[0,0].item()))
+            print(" acc[0,0] =", float(acc[0,0].item()))
+
+    if out_dtype == torch.float32:
+        return acc
+    return acc.to(out_dtype)
 
 
+def _make_groupwise_duplicated_kn(x: torch.Tensor, groupsize: int) -> torch.Tensor:
+    K, N = x.shape
+    assert K % groupsize == 0
+    x2 = x.clone()
+    for k0 in range(0, K, groupsize):
+        x2[k0:k0+groupsize, :] = x2[k0:k0+1, :].expand(groupsize, N)
+    return x2
 
-def fpint_gemm_qrow_real_2scomp_torch(
-    input_data: torch.Tensor,   # Shape: (M, K), dtype: float16
-    weight_data: torch.Tensor,  # Shape: (K, N), dtype: int8
-    scale_data: torch.Tensor,   # Shape: (K, NG), dtype: float16
-    zero_data: torch.Tensor,    # Shape: (K, NG), dtype: int16 or float16
-    groupsize: int,             # Quantization block size in N direction
-    debug: bool = False
-) -> torch.Tensor:
-    """
-    FPINT GEMM with row-wise quantization (qrow) using real 2's complement encoding - PyTorch version
 
-    This version expands scale/zero to match (K, N) shape like qcol version.
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    assert torch.cuda.is_available()
+    device = "cuda"
 
-    Args:
-        input_data: FP16 input activations, shape (M, K)
-        weight_data: Quantized weights (signed int8), shape (K, N)
-        scale_data: FP16 scale factors, shape (K, N//groupsize)
-        zero_data: Zero points (int16 or fp16), shape (K, N//groupsize)
-        groupsize: Quantization block size in N direction
-        debug: Enable debug printing
+    M, K, N = 256, 256, 256
+    groupsize = 32
 
-    Returns:
-        output_data: FP16 output, shape (M, N)
-    """
-    M, K = input_data.shape
-    K_w, N = weight_data.shape
-    assert K == K_w, f"K mismatch: input {K} vs weight {K_w}"
-    
-    device = input_data.device
-    dtype = input_data.dtype
-    
-    # NG = number of quantization blocks in N direction
-    NG = scale_data.shape[1]
-    
-    if debug:
-        print(f"[FPINT_EMUL.QROW_REAL_2SCOMP_TORCH] M={M}, N={N}, K={K}, NG={NG}, groupsize={groupsize}")
-        print(f"  input: {input_data.shape} {input_data.dtype}")
-        print(f"  weight: {weight_data.shape} {weight_data.dtype}")
-        print(f"  scale: {scale_data.shape} {scale_data.dtype}")
-        print(f"  zero: {zero_data.shape} {zero_data.dtype}")
-    
-    # Ensure weight_data is int8
-    if weight_data.dtype != torch.int8:
-        weight_data = weight_data.to(torch.int8)
-    
-    # Ensure zero_data is int16 for proper handling
-    if zero_data.dtype == torch.float16:
-        zero_data = zero_data.to(torch.int16)
-    
-    # Convert to float for computation
-    weight_fp = weight_data.float()
-    scale_fp = scale_data.float()
-    zero_fp = zero_data.float()
-    
-    # Expand scale and zero to match N dimension
-    # scale: (K, NG) -> (K, N) by repeating each block groupsize times along dim=1
-    scale_expanded = scale_fp.repeat_interleave(groupsize, dim=1)[:, :N]  # (K, N)
-    zero_expanded = zero_fp.repeat_interleave(groupsize, dim=1)[:, :N]    # (K, N)
-    
-    if debug:
-        print(f"  scale_expanded: {scale_expanded.shape}")
-        print(f"  zero_expanded: {zero_expanded.shape}")
-        if K <= 4 and N <= 4:
-            print(f"  scale_expanded:\n{scale_expanded}")
-            print(f"  zero_expanded:\n{zero_expanded}")
-    
-    # For qrow: output[m, n] = sum_k( input[m, k] * scale[k, n] * (weight[k, n] - zero[k, n]) )
-    # Rearrange: output = (input * scale_expanded.T).T @ (weight - zero_expanded)
-    # Or equivalently: output[m, n] = sum_k( (input[m, k] * scale[k, n]) * (weight[k, n] - zero[k, n]) )
-    
-    # Method 1: Expand input to (M, K, N), broadcast multiplication
-    # input_expanded: (M, K, 1) -> (M, K, N)
-    # scale_expanded: (K, N) -> (1, K, N)
-    # weight_dequant: (K, N) -> (1, K, N)
-    
-    input_expanded = input_data.unsqueeze(2)  # (M, K, 1)
-    scale_expanded_3d = scale_expanded.unsqueeze(0)  # (1, K, N)
-    
-    # Scaled input: (M, K, N)
-    scaled_input = input_expanded * scale_expanded_3d  # (M, K, N)
-    
-    # Dequantized weight: (K, N) -> (1, K, N)
-    weight_dequant = (weight_fp - zero_expanded).unsqueeze(0)  # (1, K, N)
-    
-    # Element-wise multiply and sum over K: (M, K, N) * (1, K, N) -> (M, N)
-    output_data = (scaled_input * weight_dequant).sum(dim=1)  # (M, N)
-    
-    if debug:
-        print(f"[FPINT_EMUL.QROW_REAL_2SCOMP_TORCH] Output computed, shape: {output_data.shape}")
-        if M <= 2 and N <= 4:
-            print(f"  Output values:\n{output_data}")
-    
-    return output_data.to(dtype)
+    inp = torch.tanh(torch.randn(M, K, device=device, dtype=torch.float16))
+    wt  = torch.randint(-8, 7, (K, N), device=device, dtype=torch.int8)
 
+    sc_base = (torch.rand(K, N, device=device, dtype=torch.float16) * 0.1)
+    ze_base = torch.zeros(K, N, device=device, dtype=torch.int16)
+
+    sc = _make_groupwise_duplicated_kn(sc_base, groupsize)
+    ze = _make_groupwise_duplicated_kn(ze_base, groupsize)
+
+    out_fpint = fpint_gemm_qcol_real_2scomp_torch(
+        inp, wt, sc, ze, groupsize=groupsize, out_dtype=torch.float16, debug=False
+    )
+
+    # naive reference: inp @ (scale*(w-zero))  (this is "math reference", not HW-prealign reference)
+    D = sc.to(torch.float32) * (wt.to(torch.float32) - ze.to(torch.float32))
+    out_ref = (inp.to(torch.float32) @ D).to(torch.float16)
+
+    diff = (out_fpint.to(torch.float32) - out_ref.to(torch.float32)).abs()
+    print("max_abs_err :", float(diff.max().item()))
+    print("mean_abs_err:", float(diff.mean().item()))
+    print("max_rel_err :", float((diff / (out_ref.to(torch.float32).abs() + 1e-6)).max().item()))
+    print("mean_rel_err:", float((diff / (out_ref.to(torch.float32).abs() + 1e-6)).mean().item()))
+    print("fpint[0,:8] :", out_fpint[0, :8].detach().cpu())
+    print("ref  [0,:8] :", out_ref[0, :8].detach().cpu())

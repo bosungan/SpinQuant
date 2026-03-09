@@ -702,7 +702,6 @@ class LlamaSdpaAttention(LlamaAttention):
         ] = None,  # will become mandatory in v4.46
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        # print("[LlamaSdpaAttention] Using torch.nn.functional.scaled_dot_product_attention")
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
             logger.warning_once(
@@ -803,13 +802,11 @@ class LlamaSdpaAttention(LlamaAttention):
                             k_zero = qk_wrapper.last_k_zero.reshape(bsz_k, num_heads_k, seq_len_k, head_dim_k)
                         else:
                             k_zero = torch.zeros_like(k_scale)
-                    print(f"  K from cache: k_int.shape={k_int.shape}, dtype={k_int.dtype}")
                 else:
                     # No quantization, use FP16 directly
                     k_int = key_states
                     k_scale = torch.ones_like(key_states)
                     k_zero = torch.zeros_like(key_states)
-                    print(f"  K not quantized, using FP16")
             else:
                 k_int = key_states
                 k_scale = torch.ones_like(key_states)
@@ -825,18 +822,12 @@ class LlamaSdpaAttention(LlamaAttention):
                     v_zero = self.v_proj.last_output_zero.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
                 else:
                     v_zero = torch.zeros_like(v_scale)
-                print(f"  V from cache: v_int.shape={v_int.shape}, dtype={v_int.dtype}")
             else:
                 # No quantization, use FP16 directly
                 v_int = value_states
                 v_scale = torch.ones_like(value_states)
                 v_zero = torch.zeros_like(value_states)
-                print(f"  V not quantized, using FP16")
-                
-            # print part of the quantized K and V for debugging
-            print(f"  Sample k_int[0, 0, :5, :5]:\n{k_int[0, 0, :5, :5]}")
-            print(f"  Sample v_int[0, 0, :5, :5]:\n{v_int[0, 0, :5, :5]}")
-            
+                            
             # Call custom attention
             query_states = query_states.half()
             k_int = k_int.clamp(-8, 7).to(torch.int8)

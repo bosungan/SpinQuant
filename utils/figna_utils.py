@@ -159,7 +159,7 @@ def custom_fp_int_attention(
     attn_output = torch.zeros((batch_size, num_heads, seq_len, head_dim), device=query.device, dtype=torch.float16)
     for i in range(batch_size):
         for j in range(num_heads):
-            attn_output[i, j] = fp_int_gemm_qrow_real_2scomp_torch(
+            attn_output[i, j] = fpint_gemm_qrow_real_2scomp_torch(
                 attn_weights[i, j].contiguous(), # (seq_len, seq_len)
                 value_int[i, j].contiguous(), # (seq_len, head_dim)
                 scale_v[i, j].contiguous(), # (seq_len, head_dim)
@@ -444,8 +444,8 @@ if __name__ == "__main__":
     assert torch.cuda.is_available()
     device = "cuda"
 
-    M, K, N = 4096, 128, 4096
-    groupsize = 128
+    M, K, N = 256, 256, 256
+    groupsize = 32
     
     print("="*60)
     print("Testing qcol...")

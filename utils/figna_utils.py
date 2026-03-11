@@ -299,13 +299,6 @@ def fpint_gemm_qrow_real_2scomp_torch(
     assert K % MXU_K == 0
     assert groupsize > 0
 
-    if debug:
-        print(f"[FPINT_EMUL.QROW_2SCOMP_TORCH] M={M}, N={N}, K={K}, groupsize={groupsize}")
-        print(f"  input: {input_data.shape} {input_data.dtype}")
-        print(f"  weight: {weight_data.shape} {weight_data.dtype}")
-        print(f"  scale: {scale_data.shape} {scale_data.dtype}")
-        print(f"  zero: {zero_data.shape} {zero_data.dtype}")
-
     # Convert dtypes
     if weight_data.dtype != torch.int8:
         weight_data = weight_data.to(torch.int8)
@@ -317,6 +310,7 @@ def fpint_gemm_qrow_real_2scomp_torch(
     
     # Constants
     KG = K // MXU_K
+    NG = N // groupsize 
     shift_back = EXTRA_BIT - EXTRA_BIT_FOR_REDUCE
     mant_scale = 2.0 ** (-(IN_MAN_WIDTH + EXTRA_BIT))
     two = torch.tensor(2.0, device=input_data.device, dtype=torch.float32)
@@ -327,59 +321,54 @@ def fpint_gemm_qrow_real_2scomp_torch(
     if debug:
         print("[FPINT_EMUL.QROW_2SCOMP_TORCH] ===== Start GEMM calculation =====")
 
-    # Process each output column n
-    for n in range(N):
+    # Process each group of N dim
+    for ng in range(NG):
         # Scale input: scaled_input[m, k] = input[m, k] * scale[k, n]
-        scaled_input = input_data * scale_fp[:, n].unsqueeze(0)  # (M, K)
-        scaled_input = scaled_input.to(torch.float16)  # Ensure it's FP16 for prealignment
+        n_start = ng * groupsize
+        n_end = n_start + groupsize
+        scaled_input = input_data * scale_fp[:, n_start].unsqueeze(0)  #  scale_fp[ has same values across n_start to n_end - 1
+        scaled_input = scaled_input.to(torch.float16)  # shape: (M,K) float16
         
         # Prealign scaled input
         aligned_fx_main, aligned_exp = _prealign_torch_fp16bits(scaled_input, EXTRA_BIT)
         aligned_fx_red, _ = _prealign_torch_fp16bits(scaled_input, EXTRA_BIT_FOR_REDUCE)
         
         # Get zero and weight for this column
-        z_col = zero_fp[:, n].to(torch.int64)  # (K,)
-        w_col = weight_data[:, n].to(torch.int64)  # (K,)
+        z_group = zero_fp[:, n_start:n_end].to(torch.int64)  # (K, groupsize)
+        w_group = weight_data[:, n_start:n_end].to(torch.int64)  # (K, groupsize)
+        acc_group = acc[:, n_start:n_end]  # (M, groupsize) float32 accumulator for this group
         
+        # (M, K) @ (K, groupsize) -> (M, groupsize)
         # Process K dimension in blocks of MXU_K
         for g in range(KG):
             k0 = g * MXU_K
             k1 = k0 + MXU_K
             
             # Initialize accumulators (vectorized over M)
-            inner = torch.zeros(M, device=input_data.device, dtype=torch.int64)
-            act_sum_red = torch.zeros(M, device=input_data.device, dtype=torch.int64)
+            inner = torch.zeros((M, groupsize), device=input_data.device, dtype=torch.int64)
+            act_sum_red = torch.zeros((M, groupsize), device=input_data.device, dtype=torch.int64)
             
             # MAC over MXU_K lanes (vectorized)
             for lane in range(MXU_K):
                 k = k0 + lane
-                a_main = aligned_fx_main[:, k]  # (M,)
-                a_red = aligned_fx_red[:, k]    # (M,)
-                w = w_col[k]                    # scalar
-                z = z_col[k]                    # scalar
+                a_main = aligned_fx_main[:, k].view(M, 1)  # (M,1) int64
+                w = w_group[k, :].view(1, groupsize)          # (1, groupsize) int64
+                a_red = aligned_fx_red[:, k].view(M, 1)    # (M, 1) int64
+                z = z_group[k, :].view(1, groupsize)          # (1, groupsize) int64
                 
                 inner += a_main * w
                 act_sum_red += a_red * z
             
             # Post-processing (real 2's complement: direct signed weight)
-            post = inner - (act_sum_red << shift_back)  # (M,)
+            post = inner - (act_sum_red << shift_back)  # (M, groupsize)
             
             # Convert to float with exponent restoration
             e = aligned_exp[:, g].to(torch.int32)  # (M,)
-            exp_scale = torch.pow(two, (e - IN_EXP_BIAS).to(torch.float32))  # (M,)
-            post_fp = post.to(torch.float32) * exp_scale * mant_scale  # (M,)
+            exp_scale = torch.pow(two, (e - IN_EXP_BIAS).to(torch.float32)).view(M, 1)  # (M,1)
+            post_fp = post.to(torch.float32) * exp_scale * mant_scale  # (M, groupsize) float32
             
-            # No scaling factor for real 2's complement
-            scaled_post = post_fp  # (M,)
-            
-            acc[:, n] += scaled_post
-            
-            if debug and n < 2 and g == 0:
-                print(f"[QROW_REAL_2SCOMP] n={n}, g={g}")
-                print(f"  z[{k0}]={int(z_col[k0].item())}, w[{k0}]={int(w_col[k0].item())}")
-                print(f"  inner[0]={int(inner[0].item())}, act_sum_red[0]={int(act_sum_red[0].item())}")
-                print(f"  post[0]={int(post[0].item())}, exp[0]={int(e[0].item())}")
-                print(f"  post_fp[0]={float(post_fp[0].item()):.6f}, scaled[0]={float(scaled_post[0].item()):.6f}")
+            # No post scaling
+            acc_group += post_fp
 
     if debug:
         print(f"[FPINT_EMUL.QROW_2SCOMP_TORCH] Output computed, shape: {acc.shape}")
@@ -450,12 +439,13 @@ def _make_groupwise_duplicated_nk(x: torch.Tensor, groupsize: int) -> torch.Tens
     return x2
 
 if __name__ == "__main__":
+    import time
     torch.manual_seed(0)
     assert torch.cuda.is_available()
     device = "cuda"
 
-    M, K, N = 256, 256, 256
-    groupsize = 32
+    M, K, N = 4096, 128, 4096
+    groupsize = 128
     
     print("="*60)
     print("Testing qcol...")
@@ -469,14 +459,21 @@ if __name__ == "__main__":
 
     sc = _make_groupwise_duplicated_kn(sc_base, groupsize)
     ze = _make_groupwise_duplicated_kn(ze_base, groupsize)
-
+    
+    # Measure QCOL
+    start = time.time()
     out_fpint = fpint_gemm_qcol_real_2scomp_torch(
         inp, wt, sc, ze, groupsize=groupsize, out_dtype=torch.float16, debug=False
     )
+    torch.cuda.synchronize()
+    qcol_time = time.time() - start
 
-    # naive reference: inp @ (scale*(w-zero))  (this is "math reference", not HW-prealign reference)
+    # Measure reference
+    start = time.time()
     D = sc.to(torch.float32) * (wt.to(torch.float32) - ze.to(torch.float32))
     out_ref = (inp.to(torch.float32) @ D).to(torch.float16)
+    torch.cuda.synchronize()
+    ref_time = time.time() - start
 
     diff = (out_fpint.to(torch.float32) - out_ref.to(torch.float32)).abs()
     
@@ -494,9 +491,12 @@ if __name__ == "__main__":
     sc_row = _make_groupwise_duplicated_nk(sc_base, groupsize)
     ze_row = _make_groupwise_duplicated_nk(ze_base, groupsize)
     
+    start = time.time()
     out_qrow = fpint_gemm_qrow_real_2scomp_torch(
         inp, wt, sc_row, ze_row, groupsize=groupsize, out_dtype=torch.float16, debug=False
     )
+    torch.cuda.synchronize()
+    qrow_time = time.time() - start
     
     # naive reference for qrow
     D_row = sc_row.to(torch.float32) * (wt.to(torch.float32) - ze_row.to(torch.float32))
@@ -507,3 +507,14 @@ if __name__ == "__main__":
     print(f"Is close? : {torch.allclose(out_qrow, out_ref_row, atol=1e-2, rtol=1e-2)}")
     print("qrow [0,:8] :", out_qrow[0, :8].detach().cpu())
     print("ref  [0,:8] :", out_ref_row[0, :8].detach().cpu())
+    
+    # Performance Summary
+    print("\n" + "="*70)
+    print("PERFORMANCE SUMMARY")
+    print("="*70)
+    print(f"{'Method':<15} {'Time (ms)':<15} {'vs Ref':<15} {'vs QCOL':<15}")
+    print("-"*70)
+    print(f"{'Reference':<15} {ref_time*1000:<15.2f} {'1.00x':<15} {'-':<15}")
+    print(f"{'QCOL':<15} {qcol_time*1000:<15.2f} {qcol_time/ref_time:<15.2f} {'1.00x':<15}")
+    print(f"{'QROW':<15} {qrow_time*1000:<15.2f} {qrow_time/ref_time:<15.2f} {qrow_time/qcol_time:<15.2f}")
+    print("="*70)

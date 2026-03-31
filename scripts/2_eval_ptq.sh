@@ -22,6 +22,7 @@ V_QUANT="sym"
 
 # Build directory name: {model}_W{w}A{a}KV{kv}_{dtype}_K{k_quant}_V{v_quant}
 BUILD_DIR="${MODEL_NAME}_w${2}a${3}kv${4}_${DTYPE}_K_${K_QUANT}_V_${V_QUANT}"
+mkdir -p "${BUILD_DIR}/your_output_model_path"
 
 CUDA_VISIBLE_DEVICES=2 torchrun --master_port=29502 --nnodes=1 --nproc_per_node=1 ptq.py \
 --input_model $1 \
@@ -44,4 +45,4 @@ CUDA_VISIBLE_DEVICES=2 torchrun --master_port=29502 --nnodes=1 --nproc_per_node=
 --w_groupsize 32 \
 --rotate \
 --optimized_rotation_path "${BUILD_DIR}/your_path/R.bin" \
---custom_attention \
+--save_qmodel_path "${BUILD_DIR}/your_output_model_path/consolidated.00.pth"

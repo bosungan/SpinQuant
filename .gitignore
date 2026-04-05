@@ -2,3 +2,4 @@ venv/
 fast-hadamard-transform/
 */__pycache__/
 Llama*/
+consolidated.00.pth

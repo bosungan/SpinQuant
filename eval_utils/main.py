@@ -21,6 +21,41 @@ from utils.convert_to_executorch import (
 from logging import Logger
 log: Logger = utils.get_logger("spinquant")
 
+def remove_fp_module_weights(state_dict):
+    keep_patterns = [
+        "embed_tokens.weight",
+        "lm_head.weight", 
+        "norm.weight",
+        "layernorm",
+    ]
+    keys_to_remove = [
+        k for k in state_dict.keys()
+        if (k.endswith(".module.weight") or k.endswith(".weight"))
+        and not any(pattern in k for pattern in keep_patterns)
+    ]
+    for k in keys_to_remove:
+        del state_dict[k]
+    return state_dict
+
+
+def remove_quantizer_weights(state_dict):
+    keys_to_remove = [
+        k for k in state_dict.keys()
+        if "quantizer." in k or "had_K" in k  # had_K 추가
+    ]
+    for k in keys_to_remove:
+        del state_dict[k]
+    return state_dict
+
+def convert_keys_to_awq_format(state_dict):
+    new_dict = {}
+    for k, v in state_dict.items():
+        # .module. 제거
+        new_k = k 
+        new_k = new_k.replace(".module.", ".")
+        new_dict[new_k] = v
+    return new_dict
+
 def ptq_model(args, model, model_args=None):
     transformers.set_seed(args.seed)
     model.eval()
@@ -75,12 +110,16 @@ def ptq_model(args, model, model_args=None):
                 )
             # quantize other layers with gptq
             quantizers = gptq_utils.gptq_fwrd(model, trainloader, "cuda", args)
-            save_dict["w_quantizers"] = quantizers
+            # save_dict["w_quantizers"] = quantizers
         else:  # RTN Weight Quantization
             quantizers = gptq_utils.rtn_fwrd(model, "cuda", args)
             save_dict["w_quantizers"] = quantizers
         if args.save_qmodel_path:
-            save_dict["model"] = model.state_dict()
+            save_dict = model.state_dict()
+            save_dict = remove_fp_module_weights(save_dict)
+            save_dict = remove_quantizer_weights(save_dict)
+            save_dict = convert_keys_to_awq_format(save_dict)
+
             if args.export_to_et:
                 save_dict = write_model_llama(
                     model.state_dict(), model.config, num_shards=1

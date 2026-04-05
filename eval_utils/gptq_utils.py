@@ -20,6 +20,80 @@ import tqdm
 
 from utils import quant_utils, utils
 
+import torch
+
+import torch
+
+def pack_int4_to_int32(w_int: torch.Tensor) -> torch.Tensor():
+    """
+    Pack signed int4 values [-8, 7] into int32 along the last dimension.
+    8 values per int32 (AWQ format).
+
+    Input:
+        w_int: integer tensor with shape (out_features, in_features), values in [-8, 7]
+
+    Output:
+        packed: int32 tensor with shape (out_features, in_features // 8)
+    """
+    assert w_int.dtype in (torch.int8, torch.int16, torch.int32, torch.int64)
+    assert torch.all((w_int >= -8) & (w_int <= 7)), "Values must be in [-8, 7]"
+
+    last_dim = w_int.shape[-1]
+    assert last_dim % 8 == 0, f"Last dimension must be divisible by 8, got {last_dim}"
+
+    # signed int4 [-8,7] → unsigned nibble [0,15]
+    x_u4 = (w_int.to(torch.int32) & 0xF)  # (out, in)
+
+    # (out, in//8, 8) 로 reshape 후 각 위치에 shift
+    x_grouped = x_u4.reshape(*w_int.shape[:-1], last_dim // 8, 8)  # (..., in//8, 8)
+
+    # bit 0~3: val[0], bit 4~7: val[1], ..., bit 28~31: val[7]
+    shifts = torch.arange(0, 32, 4, device=w_int.device, dtype=torch.int32)  # [0,4,8,...,28]
+    packed = (x_grouped << shifts).sum(dim=-1).to(torch.int32)  # (..., in//8)
+
+    return packed
+
+
+def compress_groupwise_scale(scale: torch.Tensor, groupsize: int, atol=0.0, rtol=0.0):
+    """
+    scale: repeated scale tensor, e.g. shape (out_features, in_features)
+           where values are repeated along the last dimension per groupsize.
+    groupsize: number of consecutive elements sharing one scale
+    atol, rtol: tolerance for equality check
+
+    Returns:
+        compressed_scale: shape (..., last_dim // groupsize)
+    Raises:
+        ValueError if the repeated pattern is not satisfied.
+    """
+    if scale.ndim < 1:
+        raise ValueError(f"scale must have at least 1 dimension, got shape={scale.shape}")
+
+    last_dim = scale.shape[-1]
+    if last_dim % groupsize != 0:
+        raise ValueError(
+            f"Last dim {last_dim} is not divisible by groupsize {groupsize}"
+        )
+
+    num_groups = last_dim // groupsize
+
+    # (..., num_groups, groupsize)
+    reshaped = scale.reshape(*scale.shape[:-1], num_groups, groupsize)
+
+    # representative value from each group
+    compressed = reshaped[..., 0]   # (..., num_groups)
+
+    # check every value in each group equals representative
+    ref = compressed.unsqueeze(-1)  # (..., num_groups, 1)
+    if not torch.allclose(reshaped, ref, atol=atol, rtol=rtol):
+        diff = (reshaped - ref).abs().max().item()
+        raise ValueError(
+            f"Scale is not constant within each group of size {groupsize}. "
+            f"Max abs diff inside group = {diff}"
+        )
+
+    return compressed
+
 class GPTQ:
     def __init__(self, layer):
         self.layer = layer
@@ -152,12 +226,14 @@ class GPTQ:
         #     self.layer.register_buffer("scale", Scale)
         
         # always register int_weight and scale
-        W_int = W_int.to(torch.int8)
-        self.layer.register_buffer(
-            "int_weight", W_int.reshape(self.layer.weight.shape)
-        )
-        self.layer.register_buffer("scale", Scale)
-        self.layer.register_buffer("groupsize", torch.tensor(groupsize))
+        W_int = W_int.to(torch.int8)        
+        W_int_T = W_int.T.contiguous()  # (in_features, out_features)
+        int_weight_packed = pack_int4_to_int32(W_int_T)  # (in_features, out_features//8)
+        assert int_weight_packed.shape == (W_int.shape[1], W_int.shape[0] // 8)
+        self.layer.register_buffer("qweight", int_weight_packed)
+
+        compressed_scale = compress_groupwise_scale(Scale, groupsize).half()
+        self.layer.register_buffer("scales", compressed_scale.T.contiguous())  # (n_groups, out)
         
         self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(
             self.layer.weight.data.dtype

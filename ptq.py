@@ -47,11 +47,11 @@ def train() -> None:
         model.lm_head.weight.data = model.model.embed_tokens.weight.data.clone()
     model.cuda()
     
-    model = ptq_model(ptq_args, model, model_args)
-    model.seqlen = training_args.model_max_length
-    if local_rank == 0:
-        log.info("Model PTQ completed {}".format(model))
-        log.info("Start to load tokenizer...")
+    # model = ptq_model(ptq_args, model, model_args)
+    # model.seqlen = training_args.model_max_length
+    # if local_rank == 0:
+    #     log.info("Model PTQ completed {}".format(model))
+    #     log.info("Start to load tokenizer...")
     tokenizer = LlamaTokenizerFast.from_pretrained(
         pretrained_model_name_or_path=model_args.input_model,
         cache_dir=training_args.cache_dir,
@@ -65,15 +65,20 @@ def train() -> None:
     log.info("Complete tokenizer loading...")
     model.config.use_cache = False
 
-    testloader = data_utils.get_wikitext2(
-        seed=ptq_args.seed,
-        seqlen=2048,
-        tokenizer=tokenizer,
-        eval_mode=True,
-    )
+    # testloader = data_utils.get_wikitext2(
+    #     seed=ptq_args.seed,
+    #     seqlen=2048,
+    #     tokenizer=tokenizer,
+    #     eval_mode=True,
+    # )
 
-    dataset_ppl = eval_utils.evaluator(model, testloader, utils.DEV, ptq_args)
-    log.info("wiki2 ppl is: {}".format(dataset_ppl))
+    # dataset_ppl = eval_utils.evaluator(model, testloader, utils.DEV, ptq_args)
+    # log.info("wiki2 ppl is: {}".format(dataset_ppl))
+
+    if ptq_args.eval_zero_shot:
+        tasks = [t.strip() for t in ptq_args.zero_shot_tasks.split(",")]
+        eval_utils.zeroshot_evaluator(model, tokenizer, tasks, batch_size=ptq_args.bsz)
+
     dist.barrier()
 
 

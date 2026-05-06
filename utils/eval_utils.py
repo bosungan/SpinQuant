@@ -16,6 +16,17 @@ from tqdm import tqdm
 
 from utils import model_utils
 
+DEFAULT_ZERO_SHOT_TASKS = [
+    "boolq",
+    "piqa",
+    "social_iqa",
+    "hellaswag",
+    "winogrande",
+    "arc_easy",
+    "arc_challenge",
+    "openbookqa",
+]
+
 
 @torch.no_grad()
 def evaluator(model, testenc, dev, args):
@@ -128,3 +139,68 @@ def evaluator(model, testenc, dev, args):
     model.config.use_cache = use_cache
     logging.info(f"\n WikiText2 PPL: {ppl.item():.3f}")
     return ppl.item()
+
+
+@torch.no_grad()
+def zeroshot_evaluator(model, tokenizer, tasks=None, batch_size=4):
+    try:
+        import lm_eval
+        from lm_eval.models.huggingface import HFLM
+    except ImportError:
+        logging.warning(
+            "lm-eval is not installed. Skipping zero-shot evaluation. "
+            "Install with: pip install lm-eval"
+        )
+        return None
+
+    if tasks is None:
+        tasks = DEFAULT_ZERO_SHOT_TASKS
+
+    print(f"Running zero-shot evaluation on: {tasks}", flush=True)
+
+    lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size)
+
+    import datasets as _hf_datasets
+    _hf_datasets.config.HF_DATASETS_TRUST_REMOTE_CODE = True
+
+    results = lm_eval.simple_evaluate(
+        model=lm,
+        tasks=tasks,
+        num_fewshot=0,
+        log_samples=False,
+    )
+
+    task_results = results["results"]
+
+    # SpinQuant paper metric convention per task
+    TASK_METRIC = {
+        "boolq":         "acc,none",
+        "piqa":          "acc,none",
+        "social_iqa":    "acc,none",
+        "hellaswag":     "acc_norm,none",
+        "winogrande":    "acc,none",
+        "arc_easy":      "acc_norm,none",
+        "arc_challenge": "acc_norm,none",
+        "openbookqa":    "acc_norm,none",
+    }
+
+    print("\n========== Zero-shot Results ==========", flush=True)
+    accs = []
+    for task, metrics in task_results.items():
+        preferred = TASK_METRIC.get(task)
+        acc = metrics.get(preferred) if preferred else None
+        # fallback: try acc_norm,none then acc,none
+        if acc is None:
+            acc = metrics.get("acc_norm,none")
+        if acc is None:
+            acc = metrics.get("acc,none")
+        if acc is not None:
+            accs.append(acc)
+            print(f"  {task:20s}: {acc * 100:.2f}%  [{preferred or 'acc,none'}]", flush=True)
+
+    if accs:
+        avg = sum(accs) / len(accs)
+        print(f"  {'Average':20s}: {avg * 100:.2f}%  ({len(accs)} tasks)", flush=True)
+    print("=======================================\n", flush=True)
+
+    return task_results

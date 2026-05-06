@@ -45,4 +45,5 @@ CUDA_VISIBLE_DEVICES=2 torchrun --master_port=29502 --nnodes=1 --nproc_per_node=
 --w_groupsize 32 \
 --rotate \
 --optimized_rotation_path "${BUILD_DIR}/your_path/R.bin" \
---save_qmodel_path "${BUILD_DIR}/your_output_model_path/consolidated.00.pth"
+--save_qmodel_path "${BUILD_DIR}/your_output_model_path/consolidated.00.pth" \
+--eval_zero_shot

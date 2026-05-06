@@ -255,6 +255,20 @@ def parser_gen():
         "--layer_idx", type=int, default=10, help="Which decoder layer to capture"
     )
 
+    # Zero-shot evaluation arguments
+    parser.add_argument(
+        "--eval_zero_shot",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run zero-shot evaluation using lm-eval-harness after PTQ",
+    )
+    parser.add_argument(
+        "--zero_shot_tasks",
+        type=str,
+        default="boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa",
+        help="Comma-separated list of lm-eval tasks for zero-shot evaluation",
+    )
+
     args, unknown = parser.parse_known_args()
 
     # assert (

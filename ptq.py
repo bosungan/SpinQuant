@@ -47,11 +47,11 @@ def train() -> None:
         model.lm_head.weight.data = model.model.embed_tokens.weight.data.clone()
     model.cuda()
     
-    # model = ptq_model(ptq_args, model, model_args)
-    # model.seqlen = training_args.model_max_length
-    # if local_rank == 0:
-    #     log.info("Model PTQ completed {}".format(model))
-    #     log.info("Start to load tokenizer...")
+    model = ptq_model(ptq_args, model, model_args)
+    model.seqlen = training_args.model_max_length
+    if local_rank == 0:
+        log.info("Model PTQ completed {}".format(model))
+        log.info("Start to load tokenizer...")
     tokenizer = LlamaTokenizerFast.from_pretrained(
         pretrained_model_name_or_path=model_args.input_model,
         cache_dir=training_args.cache_dir,

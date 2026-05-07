@@ -175,7 +175,7 @@ def zeroshot_evaluator(model, tokenizer, tasks=None, batch_size=4):
     # SpinQuant paper metric convention per task
     TASK_METRIC = {
         "boolq":         "acc,none",
-        "piqa":          "acc,none",
+        "piqa":          "acc_norm,none",
         "social_iqa":    "acc,none",
         "hellaswag":     "acc_norm,none",
         "winogrande":    "acc,none",

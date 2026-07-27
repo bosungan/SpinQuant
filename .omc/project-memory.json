@@ -1,0 +1,128 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1785157142343,
+  "projectRoot": "/home/bosungan/SpinQuant",
+  "techStack": {
+    "languages": [],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "scripts"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "eval_utils": {
+      "path": "eval_utils",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1785157142340,
+      "keyFiles": [
+        "gptq_utils.py",
+        "main.py",
+        "modeling_llama.py",
+        "rotation_utils.py"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 6,
+      "lastAccessed": 1785157142342,
+      "keyFiles": [
+        "10_optimize_rotation.sh",
+        "11_optimize_rotation_fsdp.sh",
+        "2_eval_ptq.sh",
+        "31_optimize_rotation_executorch.sh",
+        "32_eval_ptq_executorch.sh"
+      ]
+    },
+    "train_utils": {
+      "path": "train_utils",
+      "purpose": null,
+      "fileCount": 7,
+      "lastAccessed": 1785157142342,
+      "keyFiles": [
+        "apply_r3_r4.py",
+        "fsdp_trainer.py",
+        "main.py",
+        "modeling_llama_quant.py",
+        "optimizer.py"
+      ]
+    },
+    "utils": {
+      "path": "utils",
+      "purpose": "Utility functions",
+      "fileCount": 11,
+      "lastAccessed": 1785157142342,
+      "keyFiles": [
+        "convert_to_executorch.py",
+        "data_utils.py",
+        "eval_utils.py",
+        "figna_utils.py",
+        "fuse_norm_utils.py"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "utils/figna_utils.py",
+      "accessCount": 4,
+      "lastAccessed": 1785162484791,
+      "type": "file"
+    },
+    {
+      "path": "ptq.py",
+      "accessCount": 1,
+      "lastAccessed": 1785159902279,
+      "type": "file"
+    },
+    {
+      "path": "eval_utils/main.py",
+      "accessCount": 1,
+      "lastAccessed": 1785159902336,
+      "type": "file"
+    },
+    {
+      "path": "eval_utils/modeling_llama.py",
+      "accessCount": 1,
+      "lastAccessed": 1785159931331,
+      "type": "file"
+    },
+    {
+      "path": "eval_utils/rotation_utils.py",
+      "accessCount": 1,
+      "lastAccessed": 1785159932326,
+      "type": "file"
+    },
+    {
+      "path": "utils/quant_utils.py",
+      "accessCount": 1,
+      "lastAccessed": 1785159933066,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

@@ -1,0 +1,7 @@
+{
+  "tool_name": "Read",
+  "tool_input_preview": "{\"file_path\":\"/home/bosungan/SpinQuant/utils/hadamard_utils.py\"}",
+  "error": "File content (1.9MB) exceeds maximum allowed size (256KB). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.",
+  "timestamp": "2026-07-27T13:45:12.058Z",
+  "retry_count": 1
+}

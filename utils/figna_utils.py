@@ -96,7 +96,19 @@ def custom_fp_int_attention(
     # print(f"  is_causal: {is_causal}, dropout_p: {dropout_p}")
     
     batch_size, num_heads, seq_len, head_dim = query.shape
-    
+
+    # === GQA support ===
+    # Query has `num_heads` heads, but the cached K/V may have fewer heads
+    # (num_key_value_heads) when the model uses Grouped-Query Attention.
+    # Each KV head is shared by `n_rep` consecutive query heads, matching the
+    # repeat_kv mapping: query head j -> kv head (j // n_rep).
+    # For MHA (Llama-2-7B) num_kv_heads == num_heads, so n_rep == 1 (no change).
+    num_kv_heads = key_int.shape[1]
+    assert num_heads % num_kv_heads == 0, (
+        f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+    )
+    n_rep = num_heads // num_kv_heads
+
     # === Step 1: Dequantize K and V ===
     # K_fp16 = scale_k * (K_int - zero_k)
     
@@ -118,11 +130,12 @@ def custom_fp_int_attention(
     attn_weights = torch.zeros((batch_size, num_heads, seq_len, seq_len), device=query.device, dtype=torch.float16)
     for i in range(batch_size):
         for j in range(num_heads):
+            kv_j = j // n_rep  # GQA: map query head -> shared kv head
             attn_weights[i, j] = fpint_gemm_qcol_real_2scomp_torch(
                 query[i, j].contiguous(), # (seq_len, head_dim)
-                key_int[i, j].t().contiguous(), # (head_dim, seq_len)
-                scale_k[i, j].t().contiguous(), # (head_dim, seq_len)
-                zero_k[i, j].t().contiguous(), # (head_dim, seq_len)
+                key_int[i, kv_j].t().contiguous(), # (head_dim, seq_len)
+                scale_k[i, kv_j].t().contiguous(), # (head_dim, seq_len)
+                zero_k[i, kv_j].t().contiguous(), # (head_dim, seq_len)
                 groupsize=head_dim, # headwise quantization
                 out_dtype=torch.float16
             )
@@ -159,11 +172,12 @@ def custom_fp_int_attention(
     attn_output = torch.zeros((batch_size, num_heads, seq_len, head_dim), device=query.device, dtype=torch.float16)
     for i in range(batch_size):
         for j in range(num_heads):
+            kv_j = j // n_rep  # GQA: map query head -> shared kv head
             attn_output[i, j] = fpint_gemm_qrow_real_2scomp_torch(
                 attn_weights[i, j].contiguous(), # (seq_len, seq_len)
-                value_int[i, j].contiguous(), # (seq_len, head_dim)
-                scale_v[i, j].contiguous(), # (seq_len, head_dim)
-                zero_v[i, j].contiguous(), # (seq_len, head_dim)
+                value_int[i, kv_j].contiguous(), # (seq_len, head_dim)
+                scale_v[i, kv_j].contiguous(), # (seq_len, head_dim)
+                zero_v[i, kv_j].contiguous(), # (seq_len, head_dim)
                 groupsize=head_dim, # headwise quantization
                 out_dtype=torch.float16
             )

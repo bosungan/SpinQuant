@@ -44,7 +44,7 @@ def rotate_model(model, args):
         R4_rotate_down_proj_weights(layers[idx])
 
 
-class QKRotationWrapper(torch.nn.Module):
+class tationWrapper(torch.nn.Module):
     def __init__(self, func, config, *args, **kwargs):
         super().__init__()
         self.config = config
@@ -123,6 +123,6 @@ def add_qk_rotation_wrapper_after_function_call_in_forward(
         module,
         "forward",
         function_name,
-        functools.partial(QKRotationWrapper, *args, **kwargs),
+        functools.partial(tationWrapper, *args, **kwargs),
     )
     setattr(module, attr_name, wrapper)

@@ -189,7 +189,7 @@ class QKRotationWrapper(torch.nn.Module):
             self.k_quantizer.find_params(token_wise_k)
             # Cache quantized K for custom attention
             if hasattr(self, 'custom_attention') and self.custom_attention:
-                if self.k_quantiezr.sym:
+                if self.k_quantizer.sym:
                     self.last_k_int, self.last_k_scale = self.k_quantizer.quantize(token_wise_k)
                     self.last_k_zero = None
                 else:

@@ -122,6 +122,12 @@
       "accessCount": 1,
       "lastAccessed": 1785159933066,
       "type": "file"
+    },
+    {
+      "path": "HANDOFF_LLAMA3_8B.md",
+      "accessCount": 1,
+      "lastAccessed": 1785165273484,
+      "type": "file"
     }
   ],
   "userDirectives": []

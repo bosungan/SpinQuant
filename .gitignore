@@ -1,5 +1,9 @@
 venv/
 fast-hadamard-transform/
-*/__pycache__/
+**__pycache__/
 Llama*/
 *.pth
+*.log
+Meta*/
+*omc/
+*.nohup

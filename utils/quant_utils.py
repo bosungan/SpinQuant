@@ -334,7 +334,6 @@ class ActQuantWrapper(torch.nn.Module):
             self.out_quantizer.find_params(x)
             # Cache quantized values for custom attention
             if hasattr(self, 'custom_attention') and self.custom_attention:
-                print("Caching quantized output for custom attention.")
                 if self.out_quantizer.sym:
                     self.last_output_int, self.last_output_scale = self.out_quantizer.quantize(x)
                     self.last_output_zero = None

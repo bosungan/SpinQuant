@@ -268,6 +268,12 @@ def parser_gen():
         default="boolq,piqa,social_iqa,hellaswag,winogrande,arc_easy,arc_challenge,openbookqa",
         help="Comma-separated list of lm-eval tasks for zero-shot evaluation",
     )
+    parser.add_argument(
+        "--eval_ppl",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run wikitext2 perplexity evaluation after PTQ",
+    )
 
     args, unknown = parser.parse_known_args()
 

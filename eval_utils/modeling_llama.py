@@ -780,8 +780,7 @@ class LlamaSdpaAttention(LlamaAttention):
         use_custom_attn = hasattr(self.config, 'custom_attention') and self.config.custom_attention
                 
         if use_custom_attn:
-            print("[LlamaSdpaAttention] Using custom FP-INT attention")
-            
+
             # Get cached quantized K from QKRotationWrapper
             if hasattr(self, 'apply_rotary_pos_emb_qk_rotation_wrapper'):
                 qk_wrapper = self.apply_rotary_pos_emb_qk_rotation_wrapper

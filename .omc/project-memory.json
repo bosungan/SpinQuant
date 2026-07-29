@@ -89,20 +89,68 @@
   "hotPaths": [
     {
       "path": "utils/figna_utils.py",
-      "accessCount": 4,
-      "lastAccessed": 1785162484791,
-      "type": "file"
-    },
-    {
-      "path": "eval_utils/rotation_utils.py",
-      "accessCount": 2,
-      "lastAccessed": 1785163985309,
+      "accessCount": 22,
+      "lastAccessed": 1785267620978,
       "type": "file"
     },
     {
       "path": "ptq.py",
-      "accessCount": 1,
-      "lastAccessed": 1785159902279,
+      "accessCount": 8,
+      "lastAccessed": 1785257031416,
+      "type": "file"
+    },
+    {
+      "path": "autorun_eval.sh",
+      "accessCount": 6,
+      "lastAccessed": 1785222426757,
+      "type": "file"
+    },
+    {
+      "path": "eval_utils/modeling_llama.py",
+      "accessCount": 6,
+      "lastAccessed": 1785241785002,
+      "type": "file"
+    },
+    {
+      "path": "FIGNA_EMUL_OPTIMIZATION_REPORT.md",
+      "accessCount": 5,
+      "lastAccessed": 1785267731011,
+      "type": "file"
+    },
+    {
+      "path": "scripts/10_optimize_rotation_g023.sh",
+      "accessCount": 3,
+      "lastAccessed": 1785181354318,
+      "type": "file"
+    },
+    {
+      "path": "eval_utils/gptq_utils.py",
+      "accessCount": 3,
+      "lastAccessed": 1785221723268,
+      "type": "file"
+    },
+    {
+      "path": "utils/quant_utils.py",
+      "accessCount": 3,
+      "lastAccessed": 1785241735930,
+      "type": "file"
+    },
+    {
+      "path": "eval_utils/rotation_utils.py",
+      "accessCount": 3,
+      "lastAccessed": 1785241775104,
+      "type": "file"
+    },
+    {
+      "path": "test_figna_opt.py",
+      "accessCount": 2,
+      "lastAccessed": 1785256192243,
+      "type": "file"
+    },
+    {
+      "path": "utils/process_args.py",
+      "accessCount": 2,
+      "lastAccessed": 1785257023695,
       "type": "file"
     },
     {
@@ -112,21 +160,33 @@
       "type": "file"
     },
     {
-      "path": "eval_utils/modeling_llama.py",
-      "accessCount": 1,
-      "lastAccessed": 1785159931331,
-      "type": "file"
-    },
-    {
-      "path": "utils/quant_utils.py",
-      "accessCount": 1,
-      "lastAccessed": 1785159933066,
-      "type": "file"
-    },
-    {
       "path": "HANDOFF_LLAMA3_8B.md",
       "accessCount": 1,
       "lastAccessed": 1785165273484,
+      "type": "file"
+    },
+    {
+      "path": "autorun_llama3.sh",
+      "accessCount": 1,
+      "lastAccessed": 1785181823924,
+      "type": "file"
+    },
+    {
+      "path": "utils/eval_utils.py",
+      "accessCount": 1,
+      "lastAccessed": 1785188375320,
+      "type": "file"
+    },
+    {
+      "path": "test_attn_opt.py",
+      "accessCount": 1,
+      "lastAccessed": 1785256535426,
+      "type": "file"
+    },
+    {
+      "path": "autorun_pipeline.sh",
+      "accessCount": 1,
+      "lastAccessed": 1785270481540,
       "type": "file"
     }
   ],

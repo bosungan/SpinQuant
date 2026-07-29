@@ -329,7 +329,7 @@ def rtn_fwrd(model, dev, args, custom_layers=None):
 
     quantizers = {}
 
-    for i in tqdm (range(len(layers)), desc="(RtN Quant.) Layers"):
+    for i in tqdm.tqdm(range(len(layers)), desc="(RtN Quant.) Layers"):
         layer = layers[i].to(dev)
 
         subset = quant_utils.find_qlayers(

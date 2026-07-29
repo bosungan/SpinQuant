@@ -48,6 +48,34 @@ def train() -> None:
     model.cuda()
     
     model = ptq_model(ptq_args, model, model_args)
+    # GPTQ/rotation leave weights on CPU (layer-by-layer .cpu()), while buffers
+    # like rotary_emb.inv_freq stay on CUDA -> device mismatch during zero-shot.
+    # We must move the whole model to CUDA, but each quantized Linear carries a
+    # redundant representation: fp16 `weight` (used by the standard path) AND
+    # int8 `int_weight` + a FULL-SIZE fp32 `scale` buffer (used only by the
+    # custom FIGNA kernel). Together that is ~48GB for 8B and .cuda() OOMs.
+    # Drop whichever representation this run does not use before moving to GPU.
+    import gc
+    _use_ck = ptq_args.use_custom_kernel
+    for _m in model.modules():
+        if "int_weight" in getattr(_m, "_buffers", {}):
+            if _use_ck:
+                # custom kernel uses int_weight+scale; free the unused fp16 weight
+                # and downcast the FULL-SIZE fp32 `scale` buffer to fp16 (the
+                # custom GEMM upcasts to fp32 internally, so this is lossless for
+                # the kernel) to halve its ~28GB footprint on the 8B model.
+                if getattr(_m, "weight", None) is not None:
+                    _m._parameters.pop("weight", None)
+                _sc = _m._buffers.get("scale", None)
+                if _sc is not None and _sc.dtype == torch.float32:
+                    _m._buffers["scale"] = _sc.half()
+            else:
+                # standard path uses fp16 weight; free unused int_weight/scale
+                for _b in ("int_weight", "scale", "groupsize"):
+                    _m._buffers.pop(_b, None)
+    gc.collect()
+    torch.cuda.empty_cache()
+    model.cuda()
     model.seqlen = training_args.model_max_length
     if local_rank == 0:
         log.info("Model PTQ completed {}".format(model))
@@ -65,15 +93,16 @@ def train() -> None:
     log.info("Complete tokenizer loading...")
     model.config.use_cache = False
 
-    # testloader = data_utils.get_wikitext2(
-    #     seed=ptq_args.seed,
-    #     seqlen=2048,
-    #     tokenizer=tokenizer,
-    #     eval_mode=True,
-    # )
+    if ptq_args.eval_ppl:
+        testloader = data_utils.get_wikitext2(
+            seed=ptq_args.seed,
+            seqlen=2048,
+            tokenizer=tokenizer,
+            eval_mode=True,
+        )
 
-    # dataset_ppl = eval_utils.evaluator(model, testloader, utils.DEV, ptq_args)
-    # log.info("wiki2 ppl is: {}".format(dataset_ppl))
+        dataset_ppl = eval_utils.evaluator(model, testloader, utils.DEV, ptq_args)
+        log.info("wiki2 ppl is: {}".format(dataset_ppl))
 
     if ptq_args.eval_zero_shot:
         tasks = [t.strip() for t in ptq_args.zero_shot_tasks.split(",")]

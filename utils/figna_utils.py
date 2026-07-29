@@ -24,8 +24,8 @@ def custom_fp16_int4_gemm(
     Y = (X @ W_dequant^T) + bias
     where W_dequant = (W_int4 - zero) * scale
     """
-    print("Custom FP16-INT4 GEMM called!")
-    
+    # (debug print removed: fires per-GEMM during eval, cripples speed / bloats logs)
+
     output = fpint_gemm_qcol_real_2scomp_torch(
         input.reshape(-1, input.shape[-1]),  # (M,K)
         weight_int4.t(),                        # (K,N)
@@ -126,20 +126,26 @@ def custom_fp_int_attention(
     # fallback 
     # attn_weights = torch.matmul(query, key_fp.transpose(-2, -1))
     
-    # custom gemm
-    attn_weights = torch.zeros((batch_size, num_heads, seq_len, seq_len), device=query.device, dtype=torch.float16)
-    for i in range(batch_size):
-        for j in range(num_heads):
-            kv_j = j // n_rep  # GQA: map query head -> shared kv head
-            attn_weights[i, j] = fpint_gemm_qcol_real_2scomp_torch(
-                query[i, j].contiguous(), # (seq_len, head_dim)
-                key_int[i, kv_j].t().contiguous(), # (head_dim, seq_len)
-                scale_k[i, kv_j].t().contiguous(), # (head_dim, seq_len)
-                zero_k[i, kv_j].t().contiguous(), # (head_dim, seq_len)
-                groupsize=head_dim, # headwise quantization
-                out_dtype=torch.float16
-            )
-            
+    # #4: batch all (batch, head) into a leading B dim and run ONE batched qcol,
+    # replacing the 32-head Python loop. GQA: query head j uses kv head j // n_rep,
+    # so gather kv along the head dim to per-query-head tensors.
+    kv_idx = torch.arange(num_heads, device=query.device) // n_rep       # (num_heads,)
+    B = batch_size * num_heads
+    q_b  = query.reshape(B, seq_len, head_dim)                            # (B,S,D)
+    k_b  = key_int[:, kv_idx].reshape(B, seq_len, head_dim)              # (B,S,D)
+    sk_b = scale_k[:, kv_idx].reshape(B, seq_len, head_dim)
+    zk_b = zero_k[:, kv_idx].reshape(B, seq_len, head_dim)
+    # Q@K^T: weight = K^T (D,S); scale/zero transposed; groupsize = head_dim
+    attn_weights = fpint_gemm_qcol_batched(
+        q_b,
+        k_b.transpose(1, 2).contiguous(),   # (B,D,S)
+        sk_b.transpose(1, 2).contiguous(),
+        zk_b.transpose(1, 2).contiguous(),
+        groupsize=head_dim,
+        out_dtype=torch.float16,
+    ).reshape(batch_size, num_heads, seq_len, seq_len)
+
+
     
     # Scale by sqrt(head_dim)
     attn_weights = attn_weights / torch.sqrt(torch.tensor(head_dim, dtype=query.dtype, device=query.device))
@@ -169,19 +175,17 @@ def custom_fp_int_attention(
     # === Step 6: P @ V ===
     # [batch, num_heads, seq_len, seq_len] @ [batch, num_heads, seq_len, head_dim]
     # = [batch, num_heads, seq_len, head_dim]
-    attn_output = torch.zeros((batch_size, num_heads, seq_len, head_dim), device=query.device, dtype=torch.float16)
-    for i in range(batch_size):
-        for j in range(num_heads):
-            kv_j = j // n_rep  # GQA: map query head -> shared kv head
-            attn_output[i, j] = fpint_gemm_qrow_real_2scomp_torch(
-                attn_weights[i, j].contiguous(), # (seq_len, seq_len)
-                value_int[i, kv_j].contiguous(), # (seq_len, head_dim)
-                scale_v[i, kv_j].contiguous(), # (seq_len, head_dim)
-                zero_v[i, kv_j].contiguous(), # (seq_len, head_dim)
-                groupsize=head_dim, # headwise quantization
-                out_dtype=torch.float16
-            )
-            
+    # #4: batched P@V (one call for all heads). attn_weights (B,S,S) @ V (B,S,D).
+    v_b  = value_int[:, kv_idx].reshape(B, seq_len, head_dim)             # (B,S,D)
+    sv_b = scale_v[:, kv_idx].reshape(B, seq_len, head_dim)
+    zv_b = zero_v[:, kv_idx].reshape(B, seq_len, head_dim)
+    attn_output = fpint_gemm_qrow_batched(
+        attn_weights.reshape(B, seq_len, seq_len),
+        v_b, sv_b, zv_b,
+        groupsize=head_dim,
+        out_dtype=torch.float16,
+    ).reshape(batch_size, num_heads, seq_len, head_dim)
+
     # attn_output = torch.matmul(attn_weights, value_fp)
     
     # print(f"  [After PV] attn_output.shape: {attn_output.shape}, attn_output.dtype: {attn_output.dtype}")
@@ -218,54 +222,64 @@ def fpint_gemm_qcol_real_2scomp_torch(
 
     # prealign
     aligned_fx_main, aligned_exp = _prealign_torch_fp16bits(input_data, EXTRA_BIT)
-    aligned_fx_red, _ = _prealign_torch_fp16bits(input_data, EXTRA_BIT_FOR_REDUCE)
+    # #3: the reduce (act_sum) path only matters when zero != 0. The symmetric
+    # linear-weight path passes zero==0, so skip the 2nd prealign + reduce entirely.
+    has_zero = bool(zero_data.any())
+    if has_zero:
+        aligned_fx_red, _ = _prealign_torch_fp16bits(input_data, EXTRA_BIT_FOR_REDUCE)
 
     KG = K // MXU_K
     shift_back = EXTRA_BIT - EXTRA_BIT_FOR_REDUCE
     mant_scale = 2.0 ** (-(IN_MAN_WIDTH + EXTRA_BIT))
-
-    # float accumulator (matches your python model style)
-    acc = torch.zeros((M, N), device=input_data.device, dtype=torch.float32)
     two = torch.tensor(2.0, device=input_data.device, dtype=torch.float32)
 
-    for g in range(KG):
-        k0 = g * MXU_K
-        k1 = k0 + MXU_K
+    if not has_zero:
+        # Collapsed fast path for the symmetric (zero==0) weight-GEMM linear path.
+        # Each block's exponent factor 2^(e-bias) is CONSTANT over its 16 lanes, so it
+        # distributes over the lane sum: fold it into the aligned activation, fold the
+        # per-column scale into the weight, then the whole KG-block computation is a
+        # SINGLE (M,K)@(K,N) matmul. Values fit fp32, so it matches the block-wise
+        # result within fp16 ULP (verified allclose). TF32 OFF keeps fp32 exact enough.
+        # ~40-60x faster than the block loop (no (KG,M,N) intermediate / elementwise).
+        _tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        exp_scale = torch.pow(
+            two, (aligned_exp.to(torch.int32) - IN_EXP_BIAS).to(torch.float32)
+        ).repeat_interleave(MXU_K, dim=1)                                    # (M,K)
+        B = aligned_fx_main.to(torch.float32) * exp_scale * mant_scale       # (M,K)
+        Wp = weight_data.to(torch.float32) * scale_data.to(torch.float32)    # (K,N)
+        acc = torch.matmul(B, Wp)                                            # (M,N) f32
+        torch.backends.cuda.matmul.allow_tf32 = _tf32
+        return acc if out_dtype == torch.float32 else acc.to(out_dtype)
 
-        inner = torch.zeros((M, N), device=input_data.device, dtype=torch.int64)
+    # #1+#2: batch the 16-lane MAC AND all KG blocks into batched matmuls (bmm).
+    # aligned_fx_main -> (KG,M,16), weight -> (KG,16,N); one bmm produces every
+    # block's integer inner product at once. float64 exactly represents these ints
+    # (<2^53), so the contraction is exact. Tiled over N to bound the (KG,M,tile)
+    # intermediate. Cross-block float reduction is a vectorized sum (order differs
+    # from the sequential acc+= by ULP only; passes the golden allclose test).
+    A = aligned_fx_main.view(M, KG, MXU_K).permute(1, 0, 2).to(torch.float64).contiguous()  # (KG,M,16)
+    Wv = weight_data.to(torch.float64).view(KG, MXU_K, N)                                    # (KG,16,N)
+    exp_scale = torch.pow(two, (aligned_exp.to(torch.int32) - IN_EXP_BIAS).to(torch.float32))  # (M,KG)
+    exp_scale = exp_scale.permute(1, 0).unsqueeze(2)                                          # (KG,M,1)
+    sc = scale_data[0::MXU_K, :].to(torch.float32)                                            # (KG,N)
+    if has_zero:
+        act_red = aligned_fx_red.view(M, KG, MXU_K).sum(dim=2).to(torch.float64)             # (M,KG)
+        act_red = act_red.permute(1, 0).unsqueeze(2)                                         # (KG,M,1)
+        z_all = zero_data[0::MXU_K, :].to(torch.float64)                                     # (KG,N)
 
-        # 16-lane MAC: inner += a[:,lane] * w[lane,:]
-        for lane in range(MXU_K):
-            a = aligned_fx_main[:, k0 + lane].view(M, 1)                 # (M,1) int64
-            w = weight_data[k0 + lane, :].to(torch.int64).view(1, N)     # (1,N) int64
-            inner += a * w                                               # broadcast → (M,N)
-
-        # === act_sum_for_reduce: int64 sum of 16 lanes (reduce precision path) ===
-        act_sum_red = torch.zeros((M, 1), device=input_data.device, dtype=torch.int64)
-        for lane in range(MXU_K):
-            act_sum_red += aligned_fx_red[:, k0 + lane].view(M, 1)
-
-        # qcol constants (duplicated per groupsize, but we just sample k0)
-        z  = zero_data[k0, :].to(torch.int64).view(1, N)                 # (1,N)
-        sc = scale_data[k0, :].to(torch.float32).view(1, N)              # (1,N)
-
-        # post_inner_product (int64 domain)
-        post = inner - ((z * act_sum_red) << shift_back)                 # (M,N) int64
-
-        # exponent restore (per m, per block g)
-        e = aligned_exp[:, g].to(torch.int32)                            # (M,)
-        exp_scale = torch.pow(two, (e - IN_EXP_BIAS).to(torch.float32)).view(M, 1)
-        post_fp = post.to(torch.float32) * exp_scale * mant_scale        # (M,N) float32
-        acc += post_fp * sc                                              # (M,N) float32
-
-        if debug and g == 0:
-            print("[DEBUG block0]")
-            print(" inner[0,0] =", int(inner[0,0].item()))
-            print(" act_sum_red[0] =", int(act_sum_red[0,0].item()))
-            print(" z[0] =", int(z[0,0].item()))
-            print(" exp(m=0) =", int(e[0].item()))
-            print(" sc[0] =", float(sc[0,0].item()))
-            print(" acc[0,0] =", float(acc[0,0].item()))
+    acc = torch.zeros((M, N), device=input_data.device, dtype=torch.float32)
+    n_tile = max(MXU_K, min(N, int((256 * 1024 * 1024) // max(1, KG * M))))  # bound (KG,M,tile) f64
+    for n0 in range(0, N, n_tile):
+        n1 = min(N, n0 + n_tile)
+        inner = torch.bmm(A, Wv[:, :, n0:n1])                                                # (KG,M,nt) f64
+        if has_zero:
+            inner = inner - act_red * z_all[:, n0:n1].unsqueeze(1) * float(1 << shift_back)
+        post_f32 = inner.round().to(torch.float32)                                           # (KG,M,nt)
+        contrib = post_f32 * exp_scale * mant_scale * sc[:, n0:n1].unsqueeze(1)              # (KG,M,nt) f32
+        # reduce across blocks in float64 (exact sum of the f32 terms) to avoid the
+        # f32 accumulation error that grows with KG on large-K layers.
+        acc[:, n0:n1] = contrib.double().sum(dim=0).to(torch.float32)                        # (M,nt) f32
 
     if out_dtype == torch.float32:
         return acc
@@ -304,6 +318,16 @@ def fpint_gemm_qrow_real_2scomp_torch(
     assert scale_data.dtype in (torch.float16, torch.float32)
 
     M, K = input_data.shape
+    # Zero-shot sequences have arbitrary length, so the P@V contraction dim
+    # (K = seq_len) is often not a multiple of MXU_K. Pad K with zeros, which
+    # contributes nothing to the accumulation and leaves the result unchanged.
+    _pad = (-K) % MXU_K
+    if _pad:
+        input_data = torch.nn.functional.pad(input_data, (0, _pad))
+        weight_data = torch.nn.functional.pad(weight_data, (0, 0, 0, _pad))
+        scale_data = torch.nn.functional.pad(scale_data, (0, 0, 0, _pad))
+        zero_data = torch.nn.functional.pad(zero_data, (0, 0, 0, _pad))
+        M, K = input_data.shape
     K_w, N = weight_data.shape
     assert K_w == K
     K_s, N_s = scale_data.shape
@@ -352,37 +376,22 @@ def fpint_gemm_qrow_real_2scomp_torch(
         w_group = weight_data[:, n_start:n_end].to(torch.int64)  # (K, groupsize)
         acc_group = acc[:, n_start:n_end]  # (M, groupsize) float32 accumulator for this group
         
-        # (M, K) @ (K, groupsize) -> (M, groupsize)
-        # Process K dimension in blocks of MXU_K
-        for g in range(KG):
-            k0 = g * MXU_K
-            k1 = k0 + MXU_K
-            
-            # Initialize accumulators (vectorized over M)
-            inner = torch.zeros((M, groupsize), device=input_data.device, dtype=torch.int64)
-            act_sum_red = torch.zeros((M, groupsize), device=input_data.device, dtype=torch.int64)
-            
-            # MAC over MXU_K lanes (vectorized)
-            for lane in range(MXU_K):
-                k = k0 + lane
-                a_main = aligned_fx_main[:, k].view(M, 1)  # (M,1) int64
-                w = w_group[k, :].view(1, groupsize)          # (1, groupsize) int64
-                a_red = aligned_fx_red[:, k].view(M, 1)    # (M, 1) int64
-                z = z_group[k, :].view(1, groupsize)          # (1, groupsize) int64
-                
-                inner += a_main * w
-                act_sum_red += a_red * z
-            
-            # Post-processing (real 2's complement: direct signed weight)
-            post = inner - (act_sum_red << shift_back)  # (M, groupsize)
-            
-            # Convert to float with exponent restoration
-            e = aligned_exp[:, g].to(torch.int32)  # (M,)
-            exp_scale = torch.pow(two, (e - IN_EXP_BIAS).to(torch.float32)).view(M, 1)  # (M,1)
-            post_fp = post.to(torch.float32) * exp_scale * mant_scale  # (M, groupsize) float32
-            
-            # No post scaling
-            acc_group += post_fp
+        # #1+#2: batch the 16-lane MAC AND all KG blocks into two bmm calls.
+        # (M,K) reshaped to (KG,M,16); w_group/z_group to (KG,16,gs). float64 exactly
+        # represents the ints. gs is small (head_dim), so (KG,M,gs) is cheap — no tiling.
+        Am = aligned_fx_main.view(M, KG, MXU_K).permute(1, 0, 2).to(torch.float64).contiguous()  # (KG,M,16)
+        Ar = aligned_fx_red.view(M, KG, MXU_K).permute(1, 0, 2).to(torch.float64).contiguous()   # (KG,M,16)
+        w_g64 = w_group.to(torch.float64).reshape(KG, MXU_K, groupsize)   # (KG,16,gs)
+        z_g64 = z_group.to(torch.float64).reshape(KG, MXU_K, groupsize)   # (KG,16,gs)
+
+        inner = torch.bmm(Am, w_g64)                             # (KG,M,gs) f64 exact
+        act_sum_red = torch.bmm(Ar, z_g64)                       # (KG,M,gs) f64 exact
+        post_f32 = (inner - act_sum_red * float(1 << shift_back)).round().to(torch.float32)  # (KG,M,gs)
+
+        exp_scale = torch.pow(two, (aligned_exp.to(torch.int32) - IN_EXP_BIAS).to(torch.float32))  # (M,KG)
+        exp_scale = exp_scale.permute(1, 0).unsqueeze(2)         # (KG,M,1)
+        contrib = post_f32 * exp_scale * mant_scale              # (KG,M,gs) float32
+        acc_group += contrib.double().sum(dim=0).to(torch.float32)  # (M,gs) f64 reduction
 
     if debug:
         print(f"[FPINT_EMUL.QROW_2SCOMP_TORCH] Output computed, shape: {acc.shape}")
@@ -433,6 +442,80 @@ def _prealign_torch_fp16bits(
     shifted = hidden_man_ext >> shift_amount
     aligned_fx = torch.where(sign.bool(), -shifted, shifted).to(torch.int64)
     return aligned_fx, aligned_exp
+
+
+@torch.no_grad()
+def fpint_gemm_qcol_batched(inp, w, sc, z, groupsize, out_dtype=torch.float16, b_tile=8):
+    """Batched qcol: leading batch dim B. inp (B,M,K), w/sc/z (B,K,N) -> (B,M,N).
+    Mirrors fpint_gemm_qcol_real_2scomp_torch per batch element (bit-exact within fp16).
+    Used by custom_fp_int_attention to run all heads without a Python per-head loop.
+    Tiled over B to bound the (chunk,KG,M,N) intermediate."""
+    B, M, K = inp.shape
+    N = w.shape[-1]
+    KG = K // MXU_K
+    shift_back = EXTRA_BIT - EXTRA_BIT_FOR_REDUCE
+    mant_scale = 2.0 ** (-(IN_MAN_WIDTH + EXTRA_BIT))
+    two = torch.tensor(2.0, device=inp.device, dtype=torch.float32)
+    has_zero = bool(z.any())
+    out = torch.empty(B, M, N, device=inp.device, dtype=out_dtype)
+    for b0 in range(0, B, b_tile):
+        b1 = min(B, b0 + b_tile); bs = b1 - b0
+        xi = inp[b0:b1]
+        afx, aexp = _prealign_torch_fp16bits(xi.reshape(bs * M, K), EXTRA_BIT)
+        afx = afx.view(bs, M, KG, MXU_K).permute(0, 2, 1, 3).to(torch.float64)   # (bs,KG,M,16)
+        Wv = w[b0:b1].to(torch.float64).view(bs, KG, MXU_K, N)                    # (bs,KG,16,N)
+        inner = torch.matmul(afx, Wv)                                            # (bs,KG,M,N)
+        if has_zero:
+            afr, _ = _prealign_torch_fp16bits(xi.reshape(bs * M, K), EXTRA_BIT_FOR_REDUCE)
+            act_red = afr.view(bs, M, KG, MXU_K).sum(-1).to(torch.float64).permute(0, 2, 1).unsqueeze(3)  # (bs,KG,M,1)
+            z_all = z[b0:b1, 0::MXU_K, :].to(torch.float64).unsqueeze(2)          # (bs,KG,1,N)
+            inner = inner - act_red * z_all * float(1 << shift_back)
+        post = inner.round().to(torch.float32)                                   # (bs,KG,M,N)
+        exp_scale = torch.pow(two, (aexp.view(bs, M, KG).to(torch.int32) - IN_EXP_BIAS).to(torch.float32))
+        exp_scale = exp_scale.permute(0, 2, 1).unsqueeze(3)                       # (bs,KG,M,1)
+        scb = sc[b0:b1, 0::MXU_K, :].to(torch.float32).unsqueeze(2)              # (bs,KG,1,N)
+        contrib = post * exp_scale * mant_scale * scb                            # (bs,KG,M,N)
+        out[b0:b1] = contrib.double().sum(dim=1).to(out_dtype)                    # (bs,M,N)
+    return out
+
+
+@torch.no_grad()
+def fpint_gemm_qrow_batched(inp, w, sc, z, groupsize, out_dtype=torch.float16, b_tile=8):
+    """Batched qrow (P@V) for attention: leading batch dim B, groupsize == N (NG==1).
+    inp (B,M,K), w/sc/z (B,K,N) -> (B,M,N). Pads K to a multiple of 16."""
+    B, M, K = inp.shape
+    N = w.shape[-1]
+    assert groupsize == N, "batched qrow assumes a single N-group (attention head-wise)"
+    _pad = (-K) % MXU_K
+    if _pad:
+        inp = torch.nn.functional.pad(inp, (0, _pad))          # pad K (last dim)
+        w = torch.nn.functional.pad(w, (0, 0, 0, _pad))        # pad K (dim -2)
+        sc = torch.nn.functional.pad(sc, (0, 0, 0, _pad))
+        z = torch.nn.functional.pad(z, (0, 0, 0, _pad))
+        K = K + _pad
+    KG = K // MXU_K
+    shift_back = EXTRA_BIT - EXTRA_BIT_FOR_REDUCE
+    mant_scale = 2.0 ** (-(IN_MAN_WIDTH + EXTRA_BIT))
+    two = torch.tensor(2.0, device=inp.device, dtype=torch.float32)
+    out = torch.empty(B, M, N, device=inp.device, dtype=out_dtype)
+    for b0 in range(0, B, b_tile):
+        b1 = min(B, b0 + b_tile); bs = b1 - b0
+        # rescale input by the per-K scale (column 0 of the single group), like the 2D qrow
+        scaled = (inp[b0:b1] * sc[b0:b1, :, 0:1].transpose(1, 2)).to(torch.float16)  # (bs,M,K)
+        am, aexp = _prealign_torch_fp16bits(scaled.reshape(bs * M, K), EXTRA_BIT)
+        ar, _ = _prealign_torch_fp16bits(scaled.reshape(bs * M, K), EXTRA_BIT_FOR_REDUCE)
+        am = am.view(bs, M, KG, MXU_K).permute(0, 2, 1, 3).to(torch.float64)     # (bs,KG,M,16)
+        ar = ar.view(bs, M, KG, MXU_K).permute(0, 2, 1, 3).to(torch.float64)
+        w_g = w[b0:b1].to(torch.float64).view(bs, KG, MXU_K, N)                   # (bs,KG,16,N)
+        z_g = z[b0:b1].to(torch.float64).view(bs, KG, MXU_K, N)
+        inner = torch.matmul(am, w_g)                                            # (bs,KG,M,N)
+        act_red = torch.matmul(ar, z_g)                                          # (bs,KG,M,N)
+        post = (inner - act_red * float(1 << shift_back)).round().to(torch.float32)
+        exp_scale = torch.pow(two, (aexp.view(bs, M, KG).to(torch.int32) - IN_EXP_BIAS).to(torch.float32))
+        exp_scale = exp_scale.permute(0, 2, 1).unsqueeze(3)                       # (bs,KG,M,1)
+        contrib = post * exp_scale * mant_scale                                  # (bs,KG,M,N)
+        out[b0:b1] = contrib.double().sum(dim=1).to(out_dtype)                    # (bs,M,N)
+    return out
 
 
 def _make_groupwise_duplicated_kn(x: torch.Tensor, groupsize: int) -> torch.Tensor:

@@ -445,7 +445,7 @@ def _prealign_torch_fp16bits(
 
 
 @torch.no_grad()
-def fpint_gemm_qcol_batched(inp, w, sc, z, groupsize, out_dtype=torch.float16, b_tile=8):
+def fpint_gemm_qcol_batched(inp, w, sc, z, groupsize, out_dtype=torch.float16, b_tile=4):
     """Batched qcol: leading batch dim B. inp (B,M,K), w/sc/z (B,K,N) -> (B,M,N).
     Mirrors fpint_gemm_qcol_real_2scomp_torch per batch element (bit-exact within fp16).
     Used by custom_fp_int_attention to run all heads without a Python per-head loop.
@@ -480,7 +480,7 @@ def fpint_gemm_qcol_batched(inp, w, sc, z, groupsize, out_dtype=torch.float16, b
 
 
 @torch.no_grad()
-def fpint_gemm_qrow_batched(inp, w, sc, z, groupsize, out_dtype=torch.float16, b_tile=8):
+def fpint_gemm_qrow_batched(inp, w, sc, z, groupsize, out_dtype=torch.float16, b_tile=4):
     """Batched qrow (P@V) for attention: leading batch dim B, groupsize == N (NG==1).
     inp (B,M,K), w/sc/z (B,K,N) -> (B,M,N). Pads K to a multiple of 16."""
     B, M, K = inp.shape
